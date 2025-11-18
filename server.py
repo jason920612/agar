@@ -202,9 +202,12 @@ class Player:
 
     def explode_on_virus(self, cell_index, virus_mass):
         target_cell = self.cells[cell_index]
+        
+        # 總是增加病毒的質量
+        target_cell.mass += virus_mass
+        
         if target_cell.mass < VIRUS_START_MASS * 1.2: return
         
-        target_cell.mass += virus_mass
         remaining_slots = MAX_CELLS - len(self.cells)
         if remaining_slots <= 0: return
 
