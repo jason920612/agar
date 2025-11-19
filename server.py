@@ -5,16 +5,16 @@ import random
 import time
 import websockets
 import sys
-import aiohttp
-import numpy as np
+import aiohttp 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Deep Learning Server (Anti-Corner Cancer 2025)"
-SERVER_HOST = "localhost"
+SERVER_NAME = "Agar.io AI Lab (Genetic Evolution)"
+SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
-MASTER_URL = "http://localhost:8080"
+MASTER_URL = "http://localhost:8080" 
 MY_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}"
 
 # --- 遊戲常數 ---
@@ -22,40 +22,27 @@ MAP_WIDTH = 6000
 MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.0025
+MASS_DECAY_RATE = 0.0025 
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
 MAX_CELLS = 16
-SPLIT_IMPULSE = 780
+SPLIT_IMPULSE = 780    
 EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 50
+VIRUS_COUNT = 50 
 VIRUS_SHOT_IMPULSE = 850
 
 # --- 視野優化參數 ---
-GRID_SIZE = 300
-
-# --- 神經網路參數 ---
-INPUT_SIZE = 42
-HIDDEN_LAYERS = [768, 384, 192, 96]
-OUTPUT_SIZE = 4
-MUTATION_RATE = 0.02
-MUTATION_STRENGTH = 0.25
-BEST_BRAINS = {}
-
-# --- 反角落癌參數 ---
-CORNER_PUNISH_DISTANCE = 850      # 距離角落小於此值開始懲罰
-CORNER_FORCE_ESCAPE_DISTANCE = 700  # 小於此值強制往中心逃
-CORNER_SELF_KILL_PROB = 0.05      # 極近角落時自殺機率（防止死卡）
+GRID_SIZE = 300 
 
 # --- 輔助函數 ---
-def sigmoid(x): return 1 / (1 + np.exp(-x))
 def mass_to_radius(mass): return 6 * math.sqrt(mass)
 def clamp(n, minn, maxn): return max(min(maxn, n), minn)
 
+# --- 事件類型 ---
 class GameEvent:
     EAT_FOOD = "eat_food"
     EAT_EJECTED = "eat_ejected"
@@ -64,56 +51,70 @@ class GameEvent:
     SPLIT_CELL = "split"
     EJECT_MASS = "eject"
     MERGE_CELLS = "merge"
-    VIRUS_SPLIT = "virus_split"
+    VIRUS_EXPLODE = "virus_explode"
+    VIRUS_SPLIT = "virus_split" 
 
-class DeepBrain:
-    def __init__(self, layer_sizes=None, weights=None, biases=None):
-        if layer_sizes is None:
-            self.layer_sizes = [INPUT_SIZE] + HIDDEN_LAYERS + [OUTPUT_SIZE]
-        else:
-            self.layer_sizes = layer_sizes
+# --- 遺傳演算法管理器 ---
+class EvolutionManager:
+    def __init__(self):
+        self.gene_pool = [] # 儲存 (score, genes)
+        self.generation_count = 0
+        self.best_score = 0
+        
+        # 預設基因範圍 (最小值, 最大值)
+        self.base_genes = {
+            'w_food': (5000, 20000),       # 食物吸引力
+            'w_hunt': (1000000, 5000000),  # 獵殺吸引力
+            'w_flee': (-8000000, -2000000),# 逃跑排斥力 (負值)
+            'w_virus': (-20000, 50000),    # 病毒權重 (有些AI可能喜歡躲病毒旁)
+            'split_dist': (200, 700),      # 分裂攻擊距離
+            'split_aggr': (1.1, 1.5)       # 分裂攻擊所需的倍率 (例如對方比我小多少才吃)
+        }
 
-        self.weights = []
-        self.biases = []
+    def create_random_genes(self):
+        """產生隨機的第一代基因"""
+        genes = {}
+        for key, (min_v, max_v) in self.base_genes.items():
+            genes[key] = random.uniform(min_v, max_v)
+        genes['generation'] = 1
+        return genes
 
-        if weights and biases:
-            self.weights = weights
-            self.biases = biases
-        else:
-            # He Initialization (ReLU 專用)
-            for i in range(len(self.layer_sizes) - 1):
-                n_in = self.layer_sizes[i]
-                n_out = self.layer_sizes[i+1]
-                scale = np.sqrt(2.0 / n_in)
-                self.weights.append(np.random.randn(n_in, n_out) * scale)
-                self.biases.append(np.zeros(n_out))
+    def record_genome(self, bot):
+        """紀錄死亡 Bot 的表現"""
+        # 適應度函數：最大質量 + 存活時間的加權
+        score = bot.max_mass_achieved + (time.time() - bot.birth_time) * 2
+        
+        if score > self.best_score:
+            self.best_score = score
+            print(f"[EVO] New Record! Gen {bot.genes.get('generation', 1)} | Score: {int(score)} | Mass: {int(bot.max_mass_achieved)}")
 
-    def forward(self, inputs):
-        x = np.array(inputs, dtype=np.float32)
-        for i in range(len(self.weights) - 1):
-            z = np.dot(x, self.weights[i]) + self.biases[i]
-            x = np.maximum(0, z)
-        z_last = np.dot(x, self.weights[-1]) + self.biases[-1]
-        move_out = np.tanh(z_last[:2])
-        action_out = sigmoid(z_last[2:])
-        return np.concatenate((move_out, action_out))
+        self.gene_pool.append((score, copy.deepcopy(bot.genes)))
+        # 只保留前 15 名強者
+        self.gene_pool.sort(key=lambda x: x[0], reverse=True)
+        self.gene_pool = self.gene_pool[:15]
 
-    def mutate(self):
-        new_weights = []
-        new_biases = []
-        for w, b in zip(self.weights, self.biases):
-            nw = w.copy()
-            nb = b.copy()
-            mask_w = np.random.random(w.shape) < MUTATION_RATE
-            nw[mask_w] += np.random.randn(*w.shape)[mask_w] * MUTATION_STRENGTH
-            mask_b = np.random.random(b.shape) < MUTATION_RATE
-            nb[mask_b] += np.random.randn(*b.shape)[mask_b] * MUTATION_STRENGTH
-            if random.random() < 0.005:
-                ridx = random.randint(0, w.size - 1)
-                nw.flat[ridx] = random.gauss(0, 1)
-            new_weights.append(nw)
-            new_biases.append(nb)
-        return DeepBrain(self.layer_sizes, new_weights, new_biases)
+    def get_next_generation_genes(self):
+        """透過輪盤賭或隨機選取強者基因並突變"""
+        if not self.gene_pool or random.random() < 0.2:
+            # 20% 機率產生全新隨機種，保持多樣性
+            return self.create_random_genes()
+        
+        # 選取父母 (偏向高分者)
+        parent_genes = random.choice(self.gene_pool)[1]
+        child_genes = copy.deepcopy(parent_genes)
+        
+        # 突變：隨機調整基因參數 (Mutation Rate)
+        for key in self.base_genes:
+            if random.random() < 0.3: # 30% 機率突變某個基因
+                mutation_factor = random.uniform(0.8, 1.2)
+                child_genes[key] *= mutation_factor
+        
+        child_genes['generation'] = parent_genes.get('generation', 1) + 1
+        return child_genes
+
+evo_manager = EvolutionManager()
+
+# --- 類別定義 ---
 
 class GameObject:
     def __init__(self, x, y, mass, color):
@@ -165,7 +166,7 @@ class Cell(GameObject):
         if math.isnan(tx) or math.isnan(ty): return
         dx, dy = tx - self.x, ty - self.y
         dist = math.sqrt(dx**2 + dy**2)
-        base_speed = 300 * (self.mass ** -0.2)
+        base_speed = 300 * (self.mass ** -0.2) 
         if dist > 0:
             speed = min(dist * 5, base_speed)
             self.x += (dx/dist) * speed * TICK_LEN
@@ -174,6 +175,7 @@ class Cell(GameObject):
         self.y += self.boost_y * TICK_LEN
         self.boost_x *= FRICTION
         self.boost_y *= FRICTION
+        
     def decay(self):
         if self.mass > BASE_MASS:
             self.mass -= self.mass * MASS_DECAY_RATE * TICK_LEN
@@ -189,158 +191,134 @@ class Player:
         self.mouse_x, self.mouse_y = MAP_WIDTH/2, MAP_HEIGHT/2
         self.is_dead = True
         self.is_spectator = spectate
-        self.team_id = None
+        self.team_id = None 
+        self.birth_time = time.time()
+        self.max_mass_achieved = 0
         if not spectate: self.spawn()
+        
     @property
-    def total_mass(self): return sum(c.mass for c in self.cells)
+    def total_mass(self): return sum([c.mass for c in self.cells])
+    
     @property
     def center(self):
         if self.is_spectator: return (self.mouse_x, self.mouse_y)
         if not self.cells: return (MAP_WIDTH/2, MAP_HEIGHT/2)
         return (sum(c.x for c in self.cells)/len(self.cells), sum(c.y for c in self.cells)/len(self.cells))
+        
     def spawn(self):
         if self.is_spectator: return
         self.cells = [Cell(random.randint(100, MAP_WIDTH-100), random.randint(100, MAP_HEIGHT-100), BASE_MASS, self.color)]
         self.is_dead = False
+        self.birth_time = time.time()
+        self.max_mass_achieved = BASE_MASS
 
 class Bot(Player):
-    def __init__(self, pid):
-        self.team_id = random.randint(1, 4)
-        super().__init__(None, pid, f"T{self.team_id}-Bot{random.randint(10,99)}")
-        self.color = {1:"#FF3333", 2:"#33FF33", 3:"#3333FF", 4:"#FFFF33"}.get(self.team_id, "#FFF")
+    def __init__(self, pid, genes=None):
+        # Bot 名稱顯示世代數
+        gen = genes['generation'] if genes else 1
+        super().__init__(None, pid, f"Gen{gen}_Bot", False)
+        self.color = "#%06x" % random.randint(0, 0xFFFFFF)
+        # 如果沒有給定基因，就隨機生成
+        self.genes = genes if genes else evo_manager.create_random_genes()
+        self.name = f"G{self.genes['generation']}_Bot"
 
-        loaded = BEST_BRAINS.get(self.team_id)
-        if loaded and loaded['brain'].layer_sizes[0] == INPUT_SIZE:
-            self.brain = loaded['brain'].mutate()
-            self.generation = loaded['gen'] + 1
-        else:
-            self.brain = DeepBrain()
-            self.generation = 1
+    def decide(self, world):
+        if self.is_dead or not self.cells: return None
 
-        self.spawn_time = time.time()
-        self.max_mass_achieved = BASE_MASS
-        self.last_think_time = 0
-        self.last_pos = (0,0)
-        self.last_pos_check = time.time()
-        self.stag_penalty = 0
+        # 紀錄最大質量
+        current_mass = self.total_mass
+        if current_mass > self.max_mass_achieved:
+            self.max_mass_achieved = current_mass
 
-    def get_bot_inputs(self, world, cx, cy):
-        inputs = np.zeros(INPUT_SIZE)
-        my_mass = self.total_mass
+        my_largest = max(self.cells, key=lambda c: c.mass)
+        mx, my = my_largest.x, my_largest.y
+        view_dist = 800 + my_largest.radius * 5
+        
+        target_x, target_y = 0, 0
+        
+        # 1. 食物吸引力 (使用基因權重)
+        w_food = self.genes['w_food']
+        
+        gx, gy = int(mx // GRID_SIZE), int(my // GRID_SIZE)
+        search_grids = [(gx, gy), (gx+1, gy), (gx-1, gy), (gx, gy+1), (gx, gy-1)]
+        
+        food_vec_x, food_vec_y = 0, 0
+        for g in search_grids:
+            if g in world.food_grid:
+                for f in world.food_grid[g]:
+                    dx = f['x'] - mx; dy = f['y'] - my
+                    d2 = dx*dx + dy*dy
+                    if d2 < view_dist**2:
+                        # 距離越近吸引力越大
+                        weight = w_food / (d2 + 1)
+                        food_vec_x += dx * weight
+                        food_vec_y += dy * weight
+        
+        target_x += food_vec_x
+        target_y += food_vec_y
 
-        inputs[0] = cx / MAP_WIDTH
-        inputs[1] = cy / MAP_HEIGHT
-        inputs[2] = my_mass / 2000.0
-
-        threats, prey, viruses = [], [], []
-        for p in world.players.values():
+        # 2. 玩家互動 (獵殺與逃跑 - 使用基因權重)
+        action_intent = None
+        w_hunt = self.genes['w_hunt']
+        w_flee = self.genes['w_flee']
+        split_dist = self.genes['split_dist']
+        split_aggr = self.genes['split_aggr']
+        
+        for pid, p in world.players.items():
             if p.id == self.id or p.is_dead or p.is_spectator: continue
-            px, py = p.center
-            dist_sq = (px - cx)**2 + (py - cy)**2
-            if dist_sq > 6250000: continue
-            p_mass = p.total_mass
-            entry = (dist_sq, px, py, p_mass)
-            if p_mass > my_mass * 1.15:
-                threats.append(entry)
-            elif p_mass < my_mass * 0.85:
-                prey.append(entry)
+            for enemy_cell in p.cells:
+                dx = enemy_cell.x - mx; dy = enemy_cell.y - my
+                dist = math.sqrt(dx**2 + dy**2)
+                if dist > view_dist: continue
 
+                # 逃跑邏輯
+                if enemy_cell.mass > my_largest.mass * 1.15:
+                    # 權重是負的，代表反向排斥
+                    weight = w_flee / (dist + 1)
+                    target_x += (dx / dist) * weight
+                    target_y += (dy / dist) * weight
+                
+                # 獵殺邏輯
+                elif enemy_cell.mass * split_aggr < my_largest.mass:
+                    weight = w_hunt / (dist + 1)
+                    target_x += (dx / dist) * weight
+                    target_y += (dy / dist) * weight
+                    
+                    # 基因決定分裂攻擊的積極度
+                    if my_largest.mass > 50 and len(self.cells) < MAX_CELLS:
+                        if dist < split_dist:
+                            action_intent = 'split'
+
+        # 3. 病毒互動 (使用基因權重)
+        w_virus = self.genes['w_virus']
         for v in world.viruses:
-            dist_sq = (v.x - cx)**2 + (v.y - cy)**2
-            if dist_sq > 4000000: continue
-            viruses.append((dist_sq, v.x, v.y, v.mass))
+            dx = v.x - mx; dy = v.y - my
+            dist = math.sqrt(dx**2 + dy**2)
+            if dist > view_dist: continue
 
-        threats.sort(key=lambda x: x[0])
-        prey.sort(key=lambda x: x[0])
-        viruses.sort(key=lambda x: x[0])
+            if my_largest.mass > v.mass * 1.15:
+                if len(self.cells) >= MAX_CELLS:
+                     # 滿細胞時，病毒也是食物
+                     target_x += (dx/dist) * 50000
+                     target_y += (dy/dist) * 50000
+                else:
+                    # 否則套用基因裡的病毒偏好 (有些基因可能喜歡冒險靠近病毒)
+                    if dist < my_largest.radius + 100:
+                        weight = w_virus / (dist + 1)
+                        target_x += (dx/dist) * weight
+                        target_y += (dy/dist) * weight
 
-        idx = 3
-        for t in threats[:5]:
-            d = math.sqrt(t[0]) + 1
-            inputs[idx:idx+3] = [(t[1]-cx)/d, (t[2]-cy)/d, t[3]/my_mass]
-            idx += 3
-        for p in prey[:5]:
-            d = math.sqrt(p[0]) + 1
-            inputs[idx:idx+3] = [(p[1]-cx)/d, (p[2]-cy)/d, p[3]/my_mass]
-            idx += 3
-        for v in viruses[:3]:
-            d = math.sqrt(v[0]) + 1
-            inputs[idx:idx+3] = [(v[1]-cx)/d, (v[2]-cy)/d, d/1000.0]
-            idx += 3
+        # 最終決策
+        final_len = math.sqrt(target_x**2 + target_y**2)
+        if final_len > 0:
+            self.mouse_x = mx + (target_x / final_len) * 500
+            self.mouse_y = my + (target_y / final_len) * 500
+        else:
+            self.mouse_x = random.randint(0, MAP_WIDTH)
+            self.mouse_y = random.randint(0, MAP_HEIGHT)
 
-        return inputs
+        return action_intent
 
-    def think(self, world):
-        now = time.time()
-        if now - self.last_think_time < 0.08: return
-        self.last_think_time = now
-
-        if self.is_dead:
-            self.on_death(world)
-            self.spawn()
-            base = BEST_BRAINS.get(self.team_id)
-            if base and base['brain'].layer_sizes[0] == INPUT_SIZE:
-                self.brain = base['brain'].mutate()
-            else:
-                self.brain = self.brain.mutate()
-            self.max_mass_achieved = BASE_MASS
-            self.spawn_time = now
-            self.stag_penalty = 0
-            return
-
-        cx, cy = self.center
-
-        # ==================== 反角落癌懲罰（僅針對 Bot） ====================
-        dist_to_border = min(cx, cy, MAP_WIDTH - cx, MAP_HEIGHT - cy)
-
-        if dist_to_border < CORNER_FORCE_ESCAPE_DISTANCE:
-            # 極近角落：高機率直接自殺，防止死卡
-            if random.random() < CORNER_SELF_KILL_PROB:
-                self.is_dead = True
-                return
-            # 強制往地圖中心逃跑
-            center_x, center_y = MAP_WIDTH / 2, MAP_HEIGHT / 2
-            self.mouse_x = center_x + random.uniform(-800, 800)
-            self.mouse_y = center_y + random.uniform(-800, 800)
-            # 增加呆滯懲罰，降低這種基因存活率
-            self.stag_penalty += 300
-            # 即使在角落也強制思考移動
-        elif dist_to_border < CORNER_PUNISH_DISTANCE:
-            # 接近角落：輕度懲罰 + 傾向往中心移動
-            self.stag_penalty += 80
-            if random.random() < 0.3:  # 30% 機率強制往中心偏
-                center_x, center_y = MAP_WIDTH / 2, MAP_HEIGHT / 2
-                self.mouse_x = center_x + random.uniform(-600, 600)
-                self.mouse_y = center_y + random.uniform(-600, 600)
-
-        # 一般呆滯檢查
-        if now - self.last_pos_check > 5.0:
-            if math.hypot(cx - self.last_pos[0], cy - self.last_pos[1]) < 100:
-                self.stag_penalty += 600
-            self.last_pos = (cx, cy)
-            self.last_pos_check = now
-
-        # 正常神經網路思考
-        out = self.brain.forward(self.get_bot_inputs(world, cx, cy))
-
-        self.mouse_x = cx + out[0] * 900
-        self.mouse_y = cy + out[1] * 900
-
-        if out[2] > 0.68 and self.total_mass > 36:
-            world.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': self})
-        if out[3] > 0.72 and self.total_mass > 36:
-            world.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': self})
-
-    def on_death(self, world):
-        survive_time = time.time() - self.spawn_time
-        score = self.max_mass_achieved**1.25 + survive_time * 2.0 - self.stag_penalty * 3
-        best = BEST_BRAINS.get(self.team_id)
-        if not best or score > best['score']:
-            BEST_BRAINS[self.team_id] = {
-                'brain': self.brain,
-                'score': score,
-                'gen': self.generation
-            }
 
 class GameWorld:
     def __init__(self):
@@ -379,13 +357,39 @@ class GameWorld:
     def update(self):
         now = time.time()
         
-        for p in self.players.values():
-            if isinstance(p, Bot): p.think(self)
-            
         for e in self.ejected_mass: e.move()
         for v in self.viruses: v.move()
         
         active_players = [p for p in self.players.values() if not p.is_dead]
+        
+        # --- BOT Evolution & Update Logic ---
+        for p in list(self.players.values()): # 使用 list copy 以免在迭代中修改字典
+            if isinstance(p, Bot):
+                if p.is_dead:
+                    # BOT 死亡：紀錄基因 -> 獲取下一代基因 -> 轉生
+                    evo_manager.record_genome(p)
+                    new_genes = evo_manager.get_next_generation_genes()
+                    # 移除舊 Bot，建立新 Bot (ID 保持或更新皆可，這裡更新 ID 以示區別)
+                    del self.players[p.id]
+                    
+                    global pid_counter
+                    new_id = pid_counter; pid_counter += 1
+                    new_bot = Bot(new_id, genes=new_genes)
+                    new_bot.spawn()
+                    self.players[new_id] = new_bot
+                    continue
+
+                else:
+                    action = p.decide(self)
+                    if action == 'split':
+                        self.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': p})
+                    elif action == 'eject':
+                        self.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': p})
+        # ------------------------
+
+        # 重新抓取 active_players 因為上面可能換人了
+        active_players = [p for p in self.players.values() if not p.is_dead]
+
         for p in active_players:
             for cell in p.cells:
                 cell.move(p.mouse_x, p.mouse_y)
@@ -595,30 +599,9 @@ class GameWorld:
         return {'players': visible_players, 'food': visible_food, 'viruses': visible_viruses, 'ejected': visible_ejected, 'leaderboard': lb}
 
 def manage_game_commands(cmd):
-    global pid_counter, MAP_WIDTH, MAP_HEIGHT, BEST_BRAINS
+    global pid_counter, MAP_WIDTH, MAP_HEIGHT
     
-    if cmd[0] == "addbot" and len(cmd) > 1:
-        try:
-            n = int(cmd[1])
-            print(f"Adding {n} Smart Bots...")
-            for _ in range(n):
-                pid = pid_counter
-                pid_counter += 1
-                world.players[pid] = Bot(pid)
-        except ValueError: print("Invalid number")
-        
-    elif cmd[0] == "resetbrains":
-        BEST_BRAINS = {}
-        print("Brains reset.")
-
-    elif cmd[0] == "removebot" and len(cmd) > 1:
-        try:
-            n = int(cmd[1])
-            bots = [pid for pid, p in world.players.items() if isinstance(p, Bot)]
-            for pid in bots[:n]: del world.players[pid]
-        except ValueError: print("Error")
-
-    elif cmd[0] == "setsize" and len(cmd) == 3:
+    if cmd[0] == "setsize" and len(cmd) == 3:
         try:
             w, h = int(cmd[1]), int(cmd[2])
             MAP_WIDTH, MAP_HEIGHT = w, h
@@ -637,8 +620,39 @@ def manage_game_commands(cmd):
             print(f"Food Config Updated: Max={max_f}")
         except ValueError: print("Usage: foodcfg <max_amount> <spawn_rate>")
 
+    elif cmd[0] == "addbot":
+        try:
+            count = int(cmd[1]) if len(cmd) > 1 else 1
+            for _ in range(count):
+                bot_id = pid_counter
+                pid_counter += 1
+                # 初始使用隨機基因
+                bot = Bot(bot_id, genes=None)
+                world.players[bot_id] = bot
+                print(f"Bot {bot_id} added (Gen 1).")
+        except ValueError: print("Usage: addbot <count>")
+
+    elif cmd[0] == "removebot":
+        try:
+            count = int(cmd[1]) if len(cmd) > 1 else 1
+            removed = 0
+            bot_ids = [pid for pid, p in world.players.items() if isinstance(p, Bot)]
+            for i in range(min(count, len(bot_ids))):
+                del world.players[bot_ids[i]]
+                removed += 1
+            print(f"Removed {removed} bots.")
+        except ValueError: print("Usage: removebot <count>")
+    
+    elif cmd[0] == "stats":
+        print(f"--- Evo Stats ---")
+        print(f"Best Score: {int(evo_manager.best_score)}")
+        print(f"Gene Pool Size: {len(evo_manager.gene_pool)}")
+        if evo_manager.gene_pool:
+             best_gene = evo_manager.gene_pool[0][1]
+             print(f"Top Gene (Gen {best_gene['generation']}): Hunt={int(best_gene['w_hunt'])}, Flee={int(best_gene['w_flee'])}")
+
     else:
-        print("Commands: addbot, removebot, resetbrains, setsize, clearfood, foodcfg")
+        print("Commands: setsize, clearfood, foodcfg, addbot, removebot, stats")
 
 async def input_loop():
     loop = asyncio.get_event_loop()
@@ -692,7 +706,8 @@ async def game_loop():
         active_players_snapshot = list(world.players.items())
         
         for pid, p in active_players_snapshot:
-            if isinstance(p, Bot): continue
+            if isinstance(p, Bot): continue 
+            
             try: 
                 if p.is_dead and not p.is_spectator:
                      await p.ws.send(json.dumps({'type': 'death'}))
