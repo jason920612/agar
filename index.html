@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>Agar.io - Neural Client</title>
+    <title>Agar.io - Neural Client (Fixed Respawn)</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #111; font-family: 'Segoe UI', sans-serif; user-select: none; transition: background 0.3s; }
         canvas { display: block; }
@@ -98,23 +98,45 @@
         function renderServerList() { fetchServerList(); } 
 
         function connect() {
-            // ★★★ 核心修復：在關閉舊連線前，先移除 onclose 監聽器，防止誤觸發斷線邏輯 ★★★
             if(socket) {
-                socket.onclose = null; // 這行是關鍵，防止舊連線關閉時觸發 "Disconnected"
+                socket.onclose = null; 
                 socket.close();
             }
-            // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
 
             if(!currentServerUrl) return;
+            
             socket = new WebSocket(currentServerUrl);
-            socket.onopen = () => { console.log("Connected"); };
-            socket.onmessage = (e) => {
-                const msg = JSON.parse(e.data);
-                if(msg.type === 'init') { myId = msg.id; mapSize = msg.map; }
-                else if(msg.type === 'update') { processUpdate(msg.data); }
+            
+            // ★★★ 修復重點 1：連線成功時，強制重置狀態為死亡/未遊玩 ★★★
+            socket.onopen = () => { 
+                console.log("Connected to " + currentServerUrl);
+                // 強制狀態重置，確保 UI 回到初始狀態
+                isPlaying = false;
+                isSpectating = false;
+                isDead = true;
+                localPlayers = {};
+                showMenu("Play Game");
             };
             
-            // 斷線邏輯：只有當前正在使用的 socket 真的斷線時才會觸發
+            socket.onmessage = (e) => {
+                const msg = JSON.parse(e.data);
+                if(msg.type === 'init') { 
+                    myId = msg.id; 
+                    mapSize = msg.map; 
+                }
+                else if(msg.type === 'update') { 
+                    processUpdate(msg.data); 
+                }
+                // ★★★ 修復重點 2：處理伺服器發送的死亡通知 ★★★
+                else if (msg.type === 'death') {
+                    console.log("Received Death Notification");
+                    isDead = true;
+                    isPlaying = false;
+                    isSpectating = false;
+                    showMenu("Respawn");
+                }
+            };
+            
             socket.onclose = () => { 
                 console.log("Disconnected - Reconnecting...");
                 isPlaying = false;
@@ -122,7 +144,10 @@
                 isDead = true;
                 localPlayers = {}; 
                 showMenu("Play Game"); 
-                setTimeout(connect, 2000); 
+                
+                if (socket.readyState === WebSocket.CLOSED) {
+                    setTimeout(connect, 2000); 
+                }
             };
         }
 
@@ -136,18 +161,7 @@
             const activeIds = new Set();
             data.players.forEach(p => {
                 activeIds.add(p.id);
-                if(p.id === myId) {
-                    if (p.dead) {
-                        isDead = true; 
-                        if (isPlaying) { 
-                            isPlaying = false;
-                            showMenu("Respawn");
-                        }
-                    } else {
-                        isDead = false; 
-                    }
-                }
-                
+                // 這裡保留基本的檢查，但主要的死亡邏輯現在由 'death' 事件處理
                 if(!localPlayers[p.id]) localPlayers[p.id] = { ...p, renderCells: p.cells.map(c=>({...c})) };
                 else {
                     localPlayers[p.id].targetCells = p.cells;
@@ -172,6 +186,7 @@
             
             const name = document.getElementById('nickname').value || "Guest";
             socket.send(JSON.stringify({ type: 'join', name: name }));
+            // 暫時設為 true，但實際是否活著依賴 server 回應
             isPlaying = true; 
             isSpectating = false;
             isDead = false;
