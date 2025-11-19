@@ -10,7 +10,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Optimized Strat Server"
+SERVER_NAME = "High-Performance Neural Server"
 SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
@@ -32,8 +32,15 @@ EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 50 # 稍微減少病毒數量以優化性能
+VIRUS_COUNT = 50 
 VIRUS_SHOT_IMPULSE = 850
+
+# --- 視野優化參數 ---
+# 格子大小，用於空間分區加速搜尋
+GRID_SIZE = 300 
+# 客戶端視野寬度 (加上一點緩衝區)
+VIEW_W = 2000 
+VIEW_H = 1200
 
 # --- 神經網路與進化參數 ---
 INPUT_SIZE = 36   
@@ -42,7 +49,6 @@ OUTPUT_SIZE = 4
 MUTATION_RATE = 0.1 
 MUTATION_STRENGTH = 0.4 
 
-# 全域基因庫
 BEST_BRAINS = {} 
 
 def sigmoid(x):
@@ -67,7 +73,7 @@ class SimpleBrain:
     def forward(self, inputs):
         x = np.array(inputs)
         z1 = np.dot(x, self.w1) + self.b1
-        a1 = np.maximum(0, z1) # ReLU
+        a1 = np.maximum(0, z1) 
         z2 = np.dot(a1, self.w2) + self.b2
         move = np.tanh(z2[:2]) 
         actions = sigmoid(z2[2:])
@@ -144,10 +150,8 @@ class Cell:
         self.set_recombine_cooldown()
 
     def set_recombine_cooldown(self):
-        # ★★★ 修正：融合時間設定 ★★★
-        # 基礎 30 秒 + (0.02 * 質量)
-        # Mass 10 -> 30.2s
-        # Mass 1000 -> 50.0s
+        # ★★★ 修正：融合時間公式 ★★★
+        # 基礎 30s, 每增加 100 mass 增加 2s
         cooldown = 30 + (0.02 * self.mass)
         self.recombine_time = time.time() + cooldown
 
@@ -202,6 +206,13 @@ class Player:
     @property
     def total_mass(self):
         return sum([c.mass for c in self.cells])
+        
+    @property
+    def center(self):
+        if not self.cells: return (MAP_WIDTH/2, MAP_HEIGHT/2)
+        cx = sum(c.x for c in self.cells) / len(self.cells)
+        cy = sum(c.y for c in self.cells) / len(self.cells)
+        return (cx, cy)
 
     def spawn(self):
         if self.is_spectator: return
@@ -293,19 +304,15 @@ class Bot(Player):
         self.last_pos_x = 0
         self.last_pos_y = 0
         self.stagnation_penalty = 0
-        
-        # ★★★ 優化：記錄上次思考時間 ★★★
         self.last_think_time = 0 
 
     def get_inputs(self, world):
         if not self.cells: return np.zeros(INPUT_SIZE)
         
-        cx = sum(c.x for c in self.cells) / len(self.cells)
-        cy = sum(c.y for c in self.cells) / len(self.cells)
+        cx, cy = self.center
         my_mass = self.total_mass
         if my_mass > self.max_mass_achieved: self.max_mass_achieved = my_mass
 
-        # --- 1. 基礎資訊 ---
         norm_mass = min(my_mass / 10000, 1.0)
         dist_left = cx / MAP_WIDTH
         dist_right = (MAP_WIDTH - cx) / MAP_WIDTH
@@ -314,12 +321,11 @@ class Bot(Player):
         split_full = 1.0 if len(self.cells) >= MAX_CELLS else -1.0
         base_inputs = [norm_mass, dist_left, dist_right, dist_top, dist_bottom, split_full]
 
-        # --- 2. 扇形視野 (優化版) ---
         sectors_food = np.zeros(8)
         sectors_threat = np.zeros(8)
         sectors_prey = np.zeros(8)
         
-        vision_radius = 2000
+        vision_radius = 1500
         vision_radius_sq = vision_radius ** 2
 
         def get_sector_index(dx, dy):
@@ -328,19 +334,22 @@ class Bot(Player):
             idx = int((angle + math.pi/8) / (math.pi/4)) % 8
             return idx
 
-        # 優化：不計算所有食物，只取部分或使用簡單距離檢查
-        # 為了性能，這裡仍然遍歷，但在外部減少了食物總量
-        for f in world.food:
-            # 簡單矩形過濾 (比平方根快)
-            if abs(f['x'] - cx) > vision_radius or abs(f['y'] - cy) > vision_radius:
-                continue
-            
-            dx = f['x'] - cx
-            dy = f['y'] - cy
-            d_sq = dx*dx + dy*dy
-            if d_sq < vision_radius_sq:
-                idx = get_sector_index(dx, dy)
-                sectors_food[idx] += 0.5
+        # 使用 Grid 快速查找附近的食物 (大幅優化 CPU)
+        # 計算 Bot 周圍的 Grid 索引
+        min_gx = max(0, int((cx - vision_radius) // GRID_SIZE))
+        max_gx = min(int(MAP_WIDTH // GRID_SIZE), int((cx + vision_radius) // GRID_SIZE))
+        min_gy = max(0, int((cy - vision_radius) // GRID_SIZE))
+        max_gy = min(int(MAP_HEIGHT // GRID_SIZE), int((cy + vision_radius) // GRID_SIZE))
+
+        for gx in range(min_gx, max_gx + 1):
+            for gy in range(min_gy, max_gy + 1):
+                if (gx, gy) in world.food_grid:
+                    for f in world.food_grid[(gx, gy)]:
+                        dx = f['x'] - cx
+                        dy = f['y'] - cy
+                        if dx*dx + dy*dy < vision_radius_sq:
+                            idx = get_sector_index(dx, dy)
+                            sectors_food[idx] += 0.5
 
         nearest_teammate = None
         min_tm_dist = float('inf')
@@ -349,12 +358,11 @@ class Bot(Player):
         nearest_virus = None
         min_v_dist = float('inf')
 
+        # 掃描玩家 (因為玩家較少，直接迴圈還可以)
         for p in world.players.values():
             if p.id == self.id or p.is_dead: continue
             
-            # 計算玩家重心
-            p_cx = sum(c.x for c in p.cells)/len(p.cells)
-            p_cy = sum(c.y for c in p.cells)/len(p.cells)
+            p_cx, p_cy = p.center
             
             if abs(p_cx - cx) > vision_radius or abs(p_cy - cy) > vision_radius:
                 continue
@@ -388,7 +396,7 @@ class Bot(Player):
                 min_v_dist = dist
                 nearest_virus = v
 
-        # --- 3. 戰術特徵 ---
+        # 戰術特徵計算
         combined_power = 0.0
         if nearest_teammate and nearest_enemy:
             if (my_mass + nearest_teammate.total_mass) > nearest_enemy.total_mass * 1.3:
@@ -396,10 +404,8 @@ class Bot(Player):
         
         alignment = 0.0
         if nearest_teammate and nearest_enemy:
-            tm_cx = sum(c.x for c in nearest_teammate.cells)/len(nearest_teammate.cells)
-            tm_cy = sum(c.y for c in nearest_teammate.cells)/len(nearest_teammate.cells)
-            en_cx = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
-            en_cy = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            tm_cx, tm_cy = nearest_teammate.center
+            en_cx, en_cy = nearest_enemy.center
             v1 = (tm_cx - cx, tm_cy - cy)
             v2 = (en_cx - tm_cx, en_cy - tm_cy)
             m1 = math.sqrt(v1[0]**2 + v1[1]**2)
@@ -413,8 +419,7 @@ class Bot(Player):
 
         virus_shot_opp = 0.0
         if nearest_virus and nearest_enemy and min_v_dist < 700:
-            en_cx = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
-            en_cy = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            en_cx, en_cy = nearest_enemy.center
             v1 = (nearest_virus.x - cx, nearest_virus.y - cy)
             v2 = (en_cx - nearest_virus.x, en_cy - nearest_virus.y)
             m1 = math.sqrt(v1[0]**2 + v1[1]**2)
@@ -435,9 +440,6 @@ class Bot(Player):
         return np.concatenate((base_inputs, np.tanh(sectors_food), np.tanh(sectors_threat), np.tanh(sectors_prey), tactical_inputs))
 
     def think(self, world):
-        # ★★★ 性能優化核心：降低思考頻率 ★★★
-        # 每個 Bot 每 0.15 秒才思考一次 (約每秒 6-7 次)，而不是每秒 20 次
-        # 這大幅減少了 get_inputs 中的大量距離運算
         now = time.time()
         if now - self.last_think_time < 0.15: 
             return 
@@ -454,10 +456,8 @@ class Bot(Player):
             self.stagnation_penalty = 0
             return
 
-        # 呆滯懲罰 (每 5 秒)
         if now - self.last_pos_check > 5.0:
-            cx = sum(c.x for c in self.cells) / len(self.cells)
-            cy = sum(c.y for c in self.cells) / len(self.cells)
+            cx, cy = self.center
             dist = math.sqrt((cx - self.last_pos_x)**2 + (cy - self.last_pos_y)**2)
             if dist < 200:
                 self.stagnation_penalty += 1000
@@ -473,10 +473,8 @@ class Bot(Player):
         do_split = outputs[2] > 0.7
         do_eject = outputs[3] > 0.7
 
-        cx = sum(c.x for c in self.cells) / len(self.cells)
-        cy = sum(c.y for c in self.cells) / len(self.cells)
+        cx, cy = self.center
         
-        # 牆壁斥力
         wall_force_x = 0
         wall_force_y = 0
         margin = 300
@@ -520,12 +518,23 @@ class GameWorld:
         self.food = []
         self.viruses = []
         self.ejected_mass = []
-        # ★★★ 優化：減少最大食物數量 (減少迴圈運算)，增加單體質量 ★★★
-        self.max_food = 800 # 原本 1500 -> 800，大幅減少延遲
-        self.food_spawn_rate = 10
+        # 空間分區網格：key=(gx, gy), value=[food_obj, ...]
+        self.food_grid = {} 
+        self.max_food = 1000 
+        self.food_spawn_rate = 15
         self.events = []
-        self.generate_food(500)
+        self.generate_food(600)
         self.generate_viruses(VIRUS_COUNT)
+
+    def update_food_grid(self):
+        """重建食物網格，這比每次尋找快得多"""
+        self.food_grid = {}
+        for f in self.food:
+            gx = int(f['x'] // GRID_SIZE)
+            gy = int(f['y'] // GRID_SIZE)
+            if (gx, gy) not in self.food_grid:
+                self.food_grid[(gx, gy)] = []
+            self.food_grid[(gx, gy)].append(f)
 
     def generate_food(self, amount):
         for _ in range(amount):
@@ -534,9 +543,9 @@ class GameWorld:
                 'x': random.randint(0, MAP_WIDTH),
                 'y': random.randint(0, MAP_HEIGHT),
                 'color': "#%06x" % random.randint(0, 0xFFFFFF),
-                # 增加質量補償數量減少
                 'mass': random.randint(5, 10) 
             })
+        self.update_food_grid()
             
     def generate_viruses(self, amount):
         for _ in range(amount):
@@ -635,12 +644,27 @@ class GameWorld:
         for p in active_players:
             virus_hit_info = [] 
             for i, cell in enumerate(p.cells):
-                for idx in range(len(self.food) - 1, -1, -1):
-                    f = self.food[idx]
-                    if (cell.x-f['x'])**2 + (cell.y-f['y'])**2 < cell.radius**2:
-                        cell.mass += f['mass']
-                        del self.food[idx]
+                # 優化：使用 Grid 檢測碰撞食物
+                min_gx = int((cell.x - cell.radius) // GRID_SIZE)
+                max_gx = int((cell.x + cell.radius) // GRID_SIZE)
+                min_gy = int((cell.y - cell.radius) // GRID_SIZE)
+                max_gy = int((cell.y + cell.radius) // GRID_SIZE)
                 
+                for gx in range(min_gx, max_gx + 1):
+                    for gy in range(min_gy, max_gy + 1):
+                        if (gx, gy) in self.food_grid:
+                            # 倒序遍歷以便刪除
+                            for idx in range(len(self.food_grid[(gx, gy)]) - 1, -1, -1):
+                                f = self.food_grid[(gx, gy)][idx]
+                                if (cell.x-f['x'])**2 + (cell.y-f['y'])**2 < cell.radius**2:
+                                    cell.mass += f['mass']
+                                    # 從主列表和Grid中移除 (這裡需要 ID 索引比較好，暫時用對象移除)
+                                    # 為了效率，這裡標記並稍後統一清除會更好，但為了簡單：
+                                    try:
+                                        self.food.remove(f)
+                                        del self.food_grid[(gx, gy)][idx]
+                                    except: pass
+
                 for idx in range(len(self.ejected_mass) - 1, -1, -1):
                     e = self.ejected_mass[idx]
                     if e.parent_id == p.id and (now - e.birth_time < 0.2): continue
@@ -664,42 +688,97 @@ class GameWorld:
             for cell1 in p1.cells:
                 for p2 in active_players:
                     if p1.id == p2.id: continue
-                    
                     is_teammate = (p1.team_id == p2.team_id)
-                    
                     for cell2 in p2.cells:
                         dist = math.sqrt((cell1.x - cell2.x)**2 + (cell1.y - cell2.y)**2)
                         if dist < cell1.radius:
                             can_eat = False
                             if is_teammate:
-                                if cell1.mass > cell2.mass * 1.30: 
-                                    can_eat = True
+                                if cell1.mass > cell2.mass * 1.30: can_eat = True
                             else:
-                                if cell1.mass > cell2.mass * 1.25:
-                                    can_eat = True
+                                if cell1.mass > cell2.mass * 1.25: can_eat = True
                             
                             if can_eat:
                                 cell1.mass += cell2.mass
                                 cell2.mass = 0
-                    
                     p2.cells = [c for c in p2.cells if c.mass > 0]
                     if len(p2.cells) == 0: p2.is_dead = True
 
-        if len(self.food) < self.max_food: self.generate_food(self.food_spawn_rate)
+        # 定期重建食物網格 (處理生成和刪除後的碎片)
+        if len(self.food) < self.max_food: 
+            self.generate_food(self.food_spawn_rate)
+        else:
+            # 每 tick 更新一次 grid 太慢，但為了準確性還是需要
+            # 為了性能，可以在生成時只添加，刪除時只刪除
+            pass 
+
         if len(self.viruses) < VIRUS_COUNT: self.generate_viruses(1)
 
-    def get_state(self):
+    def get_view_state(self, player):
+        """
+        ★ 核心優化：只回傳玩家視野內的數據
+        """
+        cx, cy = player.center
+        view_x_min = cx - VIEW_W
+        view_x_max = cx + VIEW_W
+        view_y_min = cy - VIEW_H
+        view_y_max = cy + VIEW_H
+
+        # 1. 玩家 (包含自己，和視野內的其他玩家)
+        visible_players = []
+        for p in self.players.values():
+            if p.is_dead or p.is_spectator: continue
+            # 簡單檢查：只要有一個細胞在視野內就算
+            in_view = False
+            for c in p.cells:
+                if view_x_min < c.x < view_x_max and view_y_min < c.y < view_y_max:
+                    in_view = True
+                    break
+            
+            if in_view:
+                visible_players.append({
+                    'id': p.id, 'name': p.name, 'dead': p.is_dead, 
+                    'cells': [{'x': int(c.x), 'y': int(c.y), 'm': int(c.mass), 'c': c.color} for c in p.cells]
+                })
+
+        # 2. 食物 (只送視野內的)
+        # 使用 Grid 加速提取
+        visible_food = []
+        min_gx = max(0, int(view_x_min // GRID_SIZE))
+        max_gx = min(int(MAP_WIDTH // GRID_SIZE), int(view_x_max // GRID_SIZE))
+        min_gy = max(0, int(view_y_min // GRID_SIZE))
+        max_gy = min(int(MAP_HEIGHT // GRID_SIZE), int(view_y_max // GRID_SIZE))
+
+        for gx in range(min_gx, max_gx + 1):
+            for gy in range(min_gy, max_gy + 1):
+                if (gx, gy) in self.food_grid:
+                    for f in self.food_grid[(gx, gy)]:
+                         # 二次檢查精確位置 (因為 grid 比 view 大)
+                         if view_x_min < f['x'] < view_x_max and view_y_min < f['y'] < view_y_max:
+                             visible_food.append(f)
+        
+        # 3. 病毒與吐出物
+        visible_viruses = [
+            {'x': int(v.x), 'y': int(v.y), 'm': int(v.mass)} 
+            for v in self.viruses 
+            if view_x_min < v.x < view_x_max and view_y_min < v.y < view_y_max
+        ]
+        
+        visible_ejected = [
+            {'x': int(e.x), 'y': int(e.y), 'c': e.color} 
+            for e in self.ejected_mass
+            if view_x_min < e.x < view_x_max and view_y_min < e.y < view_y_max
+        ]
+
         lb_data = [{'id': p.id, 'name': p.name, 'mass': int(p.total_mass)} 
                    for p in sorted([p for p in self.players.values() if not p.is_dead and not p.is_spectator], 
                    key=lambda p: p.total_mass, reverse=True)[:10]]
-                   
+
         return {
-            'players': [{'id': p.id, 'name': p.name, 'dead': p.is_dead, 
-                         'cells': [{'x': int(c.x), 'y': int(c.y), 'm': int(c.mass), 'c': c.color} for c in p.cells]} 
-                        for p in self.players.values() if not p.is_spectator],
-            'food': self.food,
-            'viruses': [{'x': int(v.x), 'y': int(v.y), 'm': int(v.mass)} for v in self.viruses],
-            'ejected': [{'x': int(e.x), 'y': int(e.y), 'c': e.color} for e in self.ejected_mass],
+            'players': visible_players,
+            'food': visible_food,
+            'viruses': visible_viruses,
+            'ejected': visible_ejected,
             'leaderboard': lb_data
         }
 
@@ -755,6 +834,7 @@ def manage_game_commands(cmd):
 
     elif cmd[0] == "clearfood":
         world.food = []
+        world.food_grid = {} # 清空 Grid
         print("All food cleared.")
 
     elif cmd[0] == "foodcfg" and len(cmd) == 3:
@@ -811,7 +891,7 @@ async def game_loop():
     while True:
         start = time.time()
         world.update()
-        msg_state = json.dumps({'type': 'update', 'data': world.get_state()})
+        
         msg_events = []
         while world.events:
             event = world.events.pop(0)
@@ -821,15 +901,22 @@ async def game_loop():
         for pid, p in world.players.items():
             if isinstance(p, Bot): continue
             try: 
+                # ★★★ 核心修改：不再傳送全域 world.get_state() ★★★
+                # 而是傳送每個玩家的 get_view_state(p)
+                # 這大幅減少了封包大小，解決延遲問題
+                view_data = world.get_view_state(p)
+                msg_state = json.dumps({'type': 'update', 'data': view_data})
+                
                 await p.websocket.send(msg_state)
                 for event_msg in msg_events:
                     await p.websocket.send(event_msg)
             except: to_del.append(pid)
+            
         for pid in to_del: del world.players[pid]
         await asyncio.sleep(max(0, TICK_LEN - (time.time() - start)))
 
 async def main():
-    print(f"Optimized Neural Agar.io Server - {SERVER_NAME}")
+    print(f"High-Performance Neural Agar.io Server - {SERVER_NAME}")
     await register_to_master()
     try:
         await asyncio.gather(game_loop(), websockets.serve(handler, SERVER_HOST, SERVER_PORT), input_loop())
