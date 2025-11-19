@@ -5,16 +5,16 @@ import random
 import time
 import websockets
 import sys
-import aiohttp 
+import aiohttp
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Physics Optimized Server (Final)"
-SERVER_HOST = "localhost" 
+SERVER_NAME = "Deep Learning Server (Ultimate 2025)"
+SERVER_HOST = "localhost"
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
-MASTER_URL = "http://localhost:8080" 
+MASTER_URL = "http://localhost:8080"
 MY_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}"
 
 # --- 遊戲常數 ---
@@ -22,29 +22,29 @@ MAP_WIDTH = 6000
 MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.001 
+MASS_DECAY_RATE = 0.0025                # 關鍵修正：不能太低！
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
 MAX_CELLS = 16
-SPLIT_IMPULSE = 780    
+SPLIT_IMPULSE = 780
 EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 50 
+VIRUS_COUNT = 50
 VIRUS_SHOT_IMPULSE = 850
 
 # --- 視野優化參數 ---
-GRID_SIZE = 300 
+GRID_SIZE = 300
 
-# --- 神經網路參數 ---
-INPUT_SIZE = 9   
-HIDDEN_SIZE = 32  
-OUTPUT_SIZE = 4   
-MUTATION_RATE = 0.1 
-MUTATION_STRENGTH = 0.4 
-BEST_BRAINS = {} 
+# --- 神經網路參數（2025 最強配置）---
+INPUT_SIZE = 42
+HIDDEN_LAYERS = [768, 384, 192, 96]     # 金字塔大模型
+OUTPUT_SIZE = 4                         # 移動X, 移動Y, 分裂, 吐球
+MUTATION_RATE = 0.02
+MUTATION_STRENGTH = 0.25                # 稍微降低，更穩定
+BEST_BRAINS = {}
 
 # --- 輔助函數 ---
 def sigmoid(x): return 1 / (1 + np.exp(-x))
@@ -60,35 +60,72 @@ class GameEvent:
     SPLIT_CELL = "split"
     EJECT_MASS = "eject"
     MERGE_CELLS = "merge"
-    VIRUS_EXPLODE = "virus_explode"
-    VIRUS_SPLIT = "virus_split" 
+    VIRUS_SPLIT = "virus_split"
 
-# --- 類別定義 ---
-class SimpleBrain:
-    def __init__(self, weights=None):
-        if weights:
-            self.w1, self.b1, self.w2, self.b2 = weights
+# --- 神經網路大腦 ---
+class DeepBrain:
+    def __init__(self, layer_sizes=None, weights=None, biases=None):
+        if layer_sizes is None:
+            self.layer_sizes = [INPUT_SIZE] + HIDDEN_LAYERS + [OUTPUT_SIZE]
         else:
-            self.w1 = np.random.randn(INPUT_SIZE, HIDDEN_SIZE) * 0.5
-            self.b1 = np.zeros(HIDDEN_SIZE)
-            self.w2 = np.random.randn(HIDDEN_SIZE, OUTPUT_SIZE) * 0.5
-            self.b2 = np.zeros(OUTPUT_SIZE)
-    def forward(self, inputs):
-        x = np.array(inputs)
-        z1 = np.dot(x, self.w1) + self.b1
-        a1 = np.maximum(0, z1) 
-        z2 = np.dot(a1, self.w2) + self.b2
-        return np.concatenate((np.tanh(z2[:2]), sigmoid(z2[2:])))
-    def mutate(self):
-        new_weights = [self.w1.copy(), self.b1.copy(), self.w2.copy(), self.b2.copy()]
-        for param in new_weights:
-            if random.random() < MUTATION_RATE:
-                param += np.random.randn(*param.shape) * MUTATION_STRENGTH
-                if random.random() < 0.01:
-                    idx = random.randint(0, param.size - 1)
-                    param.flat[idx] = random.gauss(0, 1)
-        return SimpleBrain(weights=new_weights)
+            self.layer_sizes = layer_sizes
 
+        self.weights = []
+        self.biases = []
+
+        if weights and biases:
+            self.weights = weights
+            self.biases = biases
+        else:
+            # He Initialization（ReLU 專用！這行決定生死）
+            for i in range(len(self.layer_sizes) - 1):
+                n_in = self.layer_sizes[i]
+                n_out = self.layer_sizes[i+1]
+                scale = np.sqrt(2.0 / n_in)                   # ← 關鍵修正
+                self.weights.append(np.random.randn(n_in, n_out) * scale)
+                self.biases.append(np.zeros(n_out))
+
+    def forward(self, inputs):
+        x = np.array(inputs, dtype=np.float32)
+
+        # 隱藏層：ReLU
+        for i in range(len(self.weights) - 1):
+            z = np.dot(x, self.weights[i]) + self.biases[i]
+            x = np.maximum(0, z)
+
+        # 輸出層
+        z_last = np.dot(x, self.weights[-1]) + self.biases[-1]
+        move_out = np.tanh(z_last[:2])              # (-1, 1)
+        action_out = sigmoid(z_last[2:])            # (0, 1)
+        return np.concatenate((move_out, action_out))
+
+    def mutate(self):
+        new_weights = []
+        new_biases = []
+
+        for w, b in zip(self.weights, self.biases):
+            nw = w.copy()
+            nb = b.copy()
+
+            # 權重突變
+            mask_w = np.random.random(w.shape) < MUTATION_RATE
+            nw[mask_w] += np.random.randn(*w.shape)[mask_w] * MUTATION_STRENGTH
+
+            # 偏差突變
+            mask_b = np.random.random(b.shape) < MUTATION_RATE
+            nb[mask_b] += np.random.randn(*b.shape)[mask_b] * MUTATION_STRENGTH
+
+            # 極低機率大突變
+            if random.random() < 0.005:
+                ridx = random.randint(0, w.size - 1)
+                nw.flat[ridx] = random.gauss(0, 1)
+
+            new_weights.append(nw)
+            new_biases.append(nb)
+
+        return DeepBrain(self.layer_sizes, new_weights, new_biases)
+
+# --- 其餘類別不變（只改 Bot 部分）---
 class GameObject:
     def __init__(self, x, y, mass, color):
         self.x, self.y = x, y
@@ -139,17 +176,15 @@ class Cell(GameObject):
         if math.isnan(tx) or math.isnan(ty): return
         dx, dy = tx - self.x, ty - self.y
         dist = math.sqrt(dx**2 + dy**2)
-        base_speed = 300 * (self.mass ** -0.2) 
+        base_speed = 300 * (self.mass ** -0.2)
         if dist > 0:
             speed = min(dist * 5, base_speed)
             self.x += (dx/dist) * speed * TICK_LEN
             self.y += (dy/dist) * speed * TICK_LEN
-        
         self.x += self.boost_x * TICK_LEN
         self.y += self.boost_y * TICK_LEN
         self.boost_x *= FRICTION
         self.boost_y *= FRICTION
-        
     def decay(self):
         if self.mass > BASE_MASS:
             self.mass -= self.mass * MASS_DECAY_RATE * TICK_LEN
@@ -168,7 +203,7 @@ class Player:
         self.team_id = None
         if not spectate: self.spawn()
     @property
-    def total_mass(self): return sum([c.mass for c in self.cells])
+    def total_mass(self): return sum(c.mass for c in self.cells)
     @property
     def center(self):
         if self.is_spectator: return (self.mouse_x, self.mouse_y)
@@ -184,93 +219,116 @@ class Bot(Player):
         self.team_id = random.randint(1, 4)
         super().__init__(None, pid, f"T{self.team_id}-Bot{random.randint(10,99)}")
         self.color = {1:"#FF3333", 2:"#33FF33", 3:"#3333FF", 4:"#FFFF33"}.get(self.team_id, "#FFF")
-        self.brain = BEST_BRAINS.get(self.team_id, {}).get('brain', SimpleBrain()).mutate()
-        self.generation = BEST_BRAINS.get(self.team_id, {}).get('gen', 0) + 1
+
+        loaded = BEST_BRAINS.get(self.team_id)
+        if loaded and loaded['brain'].layer_sizes[0] == INPUT_SIZE:
+            self.brain = loaded['brain'].mutate()
+            self.generation = loaded['gen'] + 1
+        else:
+            self.brain = DeepBrain()
+            self.generation = 1
+
         self.spawn_time = time.time()
         self.max_mass_achieved = BASE_MASS
         self.last_think_time = 0
-        self.last_pos = (0,0); self.last_pos_check = time.time(); self.stag_penalty = 0
+        self.last_pos = (0,0)
+        self.last_pos_check = time.time()
+        self.stag_penalty = 0
 
     def get_bot_inputs(self, world, cx, cy):
         inputs = np.zeros(INPUT_SIZE)
-        
-        inputs[0] = cx / 1000.0 
-        inputs[1] = (MAP_WIDTH - cx) / 1000.0 
-        inputs[2] = cy / 1000.0 
-        inputs[3] = (MAP_HEIGHT - cy) / 1000.0 
-
-        min_dist = 99999
-        target_f = None
-        
-        gx, gy = int(cx//GRID_SIZE), int(cy//GRID_SIZE)
-        range_g = 2
-        for ix in range(gx-range_g, gx+range_g+1):
-            for iy in range(gy-range_g, gy+range_g+1):
-                if (ix, iy) in world.food_grid:
-                    for f in world.food_grid[(ix, iy)]:
-                        d2 = (f['x']-cx)**2 + (f['y']-cy)**2
-                        if d2 < min_dist:
-                            min_dist = d2
-                            target_f = f
-        
-        if target_f:
-            dist = math.sqrt(min_dist)
-            inputs[4] = (target_f['x'] - cx) / (dist + 1) 
-            inputs[5] = (target_f['y'] - cy) / (dist + 1) 
-        
-        min_dist_p = 99999
-        target_p = None
         my_mass = self.total_mass
-        
-        for p in world.players.values():
-            if p.id != self.id and not p.is_dead and not p.is_spectator:
-                if p.total_mass > my_mass * 1.2:
-                    px, py = p.center
-                    d2 = (px-cx)**2 + (py-cy)**2
-                    if d2 < min_dist_p:
-                        min_dist_p = d2
-                        target_p = p
-        
-        if target_p:
-             px, py = target_p.center
-             dist = math.sqrt(min_dist_p)
-             inputs[6] = (px - cx) / (dist + 1)
-             inputs[7] = (py - cy) / (dist + 1)
 
-        inputs[8] = my_mass / 1000.0
+        inputs[0] = cx / MAP_WIDTH
+        inputs[1] = cy / MAP_HEIGHT
+        inputs[2] = my_mass / 2000.0
+
+        threats, prey, viruses = [], [], []
+        for p in world.players.values():
+            if p.id == self.id or p.is_dead or p.is_spectator: continue
+            px, py = p.center
+            dist_sq = (px - cx)**2 + (py - cy)**2
+            if dist_sq > 6250000: continue
+            p_mass = p.total_mass
+            entry = (dist_sq, px, py, p_mass)
+            if p_mass > my_mass * 1.15:
+                threats.append(entry)
+            elif p_mass < my_mass * 0.85:
+                prey.append(entry)
+
+        for v in world.viruses:
+            dist_sq = (v.x - cx)**2 + (v.y - cy)**2
+            if dist_sq > 4000000: continue
+            viruses.append((dist_sq, v.x, v.y, v.mass))
+
+        threats.sort(key=lambda x: x[0])
+        prey.sort(key=lambda x: x[0])
+        viruses.sort(key=lambda x: x[0])
+
+        idx = 3
+        for t in threats[:5]:
+            d = math.sqrt(t[0]) + 1
+            inputs[idx:idx+3] = [(t[1]-cx)/d, (t[2]-cy)/d, t[3]/my_mass]
+            idx += 3
+        for p in prey[:5]:
+            d = math.sqrt(p[0]) + 1
+            inputs[idx:idx+3] = [(p[1]-cx)/d, (p[2]-cy)/d, p[3]/my_mass]
+            idx += 3
+        for v in viruses[:3]:
+            d = math.sqrt(v[0]) + 1
+            inputs[idx:idx+3] = [(v[1]-cx)/d, (v[2]-cy)/d, d/1000.0]
+            idx += 3
+
         return inputs
 
     def think(self, world):
         now = time.time()
-        if now - self.last_think_time < 0.15: return
+        if now - self.last_think_time < 0.08: return          # 更快思考
         self.last_think_time = now
-        
+
         if self.is_dead:
             self.on_death(world)
             self.spawn()
-            self.brain = BEST_BRAINS.get(self.team_id, {}).get('brain', self.brain).mutate()
-            self.max_mass_achieved = BASE_MASS; self.spawn_time = now; self.stag_penalty = 0
+            base = BEST_BRAINS.get(self.team_id)
+            if base and base['brain'].layer_sizes[0] == INPUT_SIZE:
+                self.brain = base['brain'].mutate()
+            else:
+                self.brain = self.brain.mutate()
+            self.max_mass_achieved = BASE_MASS
+            self.spawn_time = now
+            self.stag_penalty = 0
             return
 
         cx, cy = self.center
-        if now - self.last_pos_check > 5.0:
-            if math.sqrt((cx-self.last_pos[0])**2 + (cy-self.last_pos[1])**2) < 100:
-                self.stag_penalty += 500 
-            self.last_pos = (cx, cy); self.last_pos_check = now
 
-        inputs = self.get_bot_inputs(world, cx, cy)
-        out = self.brain.forward(inputs)
-        
-        self.mouse_x = cx + out[0] * 500
-        self.mouse_y = cy + out[1] * 500
-        
-        if out[2] > 0.8 and self.total_mass > 36: world.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': self})
-        if out[3] > 0.8 and self.total_mass > 36: world.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': self})
+        # 呆滯懲罰
+        if now - self.last_pos_check > 5.0:
+            if math.hypot(cx - self.last_pos[0], cy - self.last_pos[1]) < 100:
+                self.stag_penalty += 600
+            self.last_pos = (cx, cy)
+            self.last_pos_check = now
+
+        out = self.brain.forward(self.get_bot_inputs(world, cx, cy))
+
+        # 更遠視野 + 更敏感動作
+        self.mouse_x = cx + out[0] * 900
+        self.mouse_y = cy + out[1] * 900
+
+        if out[2] > 0.68 and self.total_mass > 36:
+            world.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': self})
+        if out[3] > 0.72 and self.total_mass > 36:
+            world.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': self})
 
     def on_death(self, world):
-        score = self.max_mass_achieved + (time.time()-self.spawn_time)*0.5 - self.stag_penalty
+        survive_time = time.time() - self.spawn_time
+        score = self.max_mass_achieved**1.25 + survive_time * 2.0 - self.stag_penalty * 3
         best = BEST_BRAINS.get(self.team_id)
-        if not best or score > best['score']: BEST_BRAINS[self.team_id] = {'brain': self.brain, 'score': score, 'gen': self.generation}
+        if not best or score > best['score']:
+            BEST_BRAINS[self.team_id] = {
+                'brain': self.brain,
+                'score': score,
+                'gen': self.generation
+            }
 
 class GameWorld:
     def __init__(self):
