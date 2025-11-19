@@ -5,35 +5,50 @@ import random
 import time
 import websockets
 import sys
-import aiohttp # 需要 pip install aiohttp
+import aiohttp 
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Taiwan No.1 Server"
-SERVER_HOST = "localhost" # 本機對外 IP 或域名
+SERVER_NAME = "Pro-Team Strat Neural Server"
+SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
-# ★★★ 中央伺服器地址 ★★★
 MASTER_URL = "http://localhost:8080" 
 MY_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}"
 
 # --- 遊戲常數 ---
-MAP_WIDTH = 3000
-MAP_HEIGHT = 3000
+MAP_WIDTH = 6000
+MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.01 
+MASS_DECAY_RATE = 0.001 # 極低的衰減，鼓勵囤積質量
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
 MAX_CELLS = 16
-SPLIT_IMPULSE = 750
-EJECT_IMPULSE = 500
-FRICTION = 0.92
+SPLIT_IMPULSE = 780    # 增加分裂推力，讓 Tricksplit 更猛
+EJECT_IMPULSE = 550
+FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 30
-VIRUS_SHOT_IMPULSE = 800
+VIRUS_COUNT = 60
+VIRUS_SHOT_IMPULSE = 850
+
+# --- 神經網路與進化參數 ---
+# 輸入層擴增至 36：
+# 6(基礎) + 24(扇形視野) + 6(高階戰術特徵)
+INPUT_SIZE = 36   
+HIDDEN_SIZE = 32  # 增加大腦容量以處理複雜戰術
+OUTPUT_SIZE = 4   # MoveX, MoveY, Split, Eject
+MUTATION_RATE = 0.1 
+MUTATION_STRENGTH = 0.4 # 強突變，嘗試激進策略
+
+# 全域基因庫
+BEST_BRAINS = {} 
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
 
 def mass_to_radius(mass):
     return 6 * math.sqrt(mass)
@@ -41,17 +56,55 @@ def mass_to_radius(mass):
 def clamp(n, minn, maxn):
     return max(min(maxn, n), minn)
 
+class SimpleBrain:
+    def __init__(self, weights=None):
+        if weights:
+            self.w1, self.b1, self.w2, self.b2 = weights
+        else:
+            self.w1 = np.random.randn(INPUT_SIZE, HIDDEN_SIZE) * 0.5
+            self.b1 = np.zeros(HIDDEN_SIZE)
+            self.w2 = np.random.randn(HIDDEN_SIZE, OUTPUT_SIZE) * 0.5
+            self.b2 = np.zeros(OUTPUT_SIZE)
+
+    def forward(self, inputs):
+        x = np.array(inputs)
+        # Layer 1
+        z1 = np.dot(x, self.w1) + self.b1
+        a1 = np.maximum(0, z1) # ReLU
+        
+        # Layer 2
+        z2 = np.dot(a1, self.w2) + self.b2
+        
+        # Outputs
+        move = np.tanh(z2[:2]) 
+        actions = sigmoid(z2[2:])
+        
+        return np.concatenate((move, actions))
+
+    def mutate(self):
+        new_weights = [self.w1.copy(), self.b1.copy(), self.w2.copy(), self.b2.copy()]
+        for param in new_weights:
+            if random.random() < MUTATION_RATE:
+                noise = np.random.randn(*param.shape) * MUTATION_STRENGTH
+                param += noise
+                # 隨機重置神經元連接，尋找新的戰術路徑
+                if random.random() < 0.01:
+                    idx = random.randint(0, param.size - 1)
+                    param.flat[idx] = random.gauss(0, 1)
+        return SimpleBrain(weights=new_weights)
+
 class EjectedMass:
-    def __init__(self, x, y, angle, color, parent_id):
+    def __init__(self, x, y, angle, color, parent_id, team_id=None):
         self.id = random.randint(100000, 999999)
         self.x = x
         self.y = y
-        self.mass = 15
+        self.mass = 16 # 稍微增加 W 的質量
         self.color = color
         self.radius = mass_to_radius(self.mass)
         self.vx = math.cos(angle) * EJECT_IMPULSE
         self.vy = math.sin(angle) * EJECT_IMPULSE
         self.parent_id = parent_id
+        self.team_id = team_id
         self.birth_time = time.time()
         
     def move(self):
@@ -100,7 +153,8 @@ class Cell:
         self.set_recombine_cooldown()
 
     def set_recombine_cooldown(self):
-        cooldown = 30 + (0.02 * self.mass)
+        # 加快合球速度，方便快速傳遞質量
+        cooldown = 5 + (0.01 * self.mass) # 原本是 30 + 0.02
         self.recombine_time = time.time() + cooldown
 
     @property
@@ -147,6 +201,7 @@ class Player:
         self.mouse_y = MAP_HEIGHT / 2
         self.is_dead = True
         self.is_spectator = spectate
+        self.team_id = None 
         if not spectate:
             self.spawn()
 
@@ -190,34 +245,28 @@ class Player:
         if self.is_dead: return
         for cell in self.cells:
             if cell.mass < 35: continue
-            cell.mass -= 18
+            cell.mass -= 16
             dx = self.mouse_x - cell.x
             dy = self.mouse_y - cell.y
             angle = math.atan2(dy, dx)
             
             start_x = cell.x + math.cos(angle) * cell.radius
             start_y = cell.y + math.sin(angle) * cell.radius
-            ejected = EjectedMass(start_x, start_y, angle, cell.color, self.id)
+            ejected = EjectedMass(start_x, start_y, angle, cell.color, self.id, self.team_id)
             world.ejected_mass.append(ejected)
 
     def explode_on_virus(self, cell_index, virus_mass):
         target_cell = self.cells[cell_index]
-        
-        # 總是增加病毒的質量
         target_cell.mass += virus_mass
-        
+        if len(self.cells) >= MAX_CELLS: return
         if target_cell.mass < VIRUS_START_MASS * 1.2: return
-        
         remaining_slots = MAX_CELLS - len(self.cells)
         if remaining_slots <= 0: return
-
         num_new_frags = min(remaining_slots, 7)
         total_pieces = num_new_frags + 1
         piece_mass = target_cell.mass / total_pieces
-        
         target_cell.mass = piece_mass
         target_cell.set_recombine_cooldown()
-        
         new_frags = []
         for i in range(num_new_frags):
             angle = (i / num_new_frags) * math.pi * 2
@@ -225,94 +274,264 @@ class Player:
             speed = SPLIT_IMPULSE * 0.8
             frag.apply_force(math.cos(angle) * speed, math.sin(angle) * speed)
             new_frags.append(frag)
-            
         self.cells.extend(new_frags)
 
 class Bot(Player):
     def __init__(self, pid):
-        name = f"Bot-{chr(random.randint(65, 90))}{random.randint(10,99)}"
+        self.team_id = random.randint(1, 4) 
+        name = f"T{self.team_id}-Bot{random.randint(10,99)}"
         super().__init__(None, pid, name)
-        self.genes = {
-            'food_weight': random.uniform(1, 8),
-            'prey_weight': random.uniform(5, 25),
-            'predator_weight': random.uniform(10, 50),
-            'virus_weight': random.uniform(-5, 30),
-            'split_aggression': random.uniform(0, 1)
-        }
-        self.color = "#%06x" % random.randint(0xAAAAAA, 0xFFFFFF)
+        
+        team_colors = {1: "#FF3333", 2: "#33FF33", 3: "#3333FF", 4: "#FFFF33"}
+        self.color = team_colors.get(self.team_id, "#FFFFFF")
+        
+        if self.team_id in BEST_BRAINS:
+            parent_brain = BEST_BRAINS[self.team_id]['brain']
+            self.brain = parent_brain.mutate()
+            self.generation = BEST_BRAINS[self.team_id]['gen'] + 1
+        else:
+            self.brain = SimpleBrain() 
+            self.generation = 1
+            
+        self.spawn_time = time.time()
+        self.max_mass_achieved = BASE_MASS
+        self.last_pos_check = time.time()
+        self.last_pos_x = 0
+        self.last_pos_y = 0
+        self.stagnation_penalty = 0
 
-    def think(self, world):
-        if self.is_dead or not self.cells:
-            if self.is_dead: self.spawn()
-            return
-
+    def get_inputs(self, world):
+        if not self.cells: return np.zeros(INPUT_SIZE)
+        
         cx = sum(c.x for c in self.cells) / len(self.cells)
         cy = sum(c.y for c in self.cells) / len(self.cells)
-        avg_mass = self.total_mass / len(self.cells)
+        my_mass = self.total_mass
+        if my_mass > self.max_mass_achieved: self.max_mass_achieved = my_mass
 
-        move_x, move_y = 0, 0
+        # --- 1. 基礎資訊 (6) ---
+        norm_mass = min(my_mass / 10000, 1.0)
+        dist_left = cx / MAP_WIDTH
+        dist_right = (MAP_WIDTH - cx) / MAP_WIDTH
+        dist_top = cy / MAP_HEIGHT
+        dist_bottom = (MAP_HEIGHT - cy) / MAP_HEIGHT
+        split_full = 1.0 if len(self.cells) >= MAX_CELLS else -1.0
+        base_inputs = [norm_mass, dist_left, dist_right, dist_top, dist_bottom, split_full]
+
+        # --- 2. 扇形視野 (24) ---
+        sectors_food = np.zeros(8)
+        sectors_threat = np.zeros(8) # 比我大的敵人
+        sectors_prey = np.zeros(8)   # 比我小的敵人 (可吃)
         
-        # 1. Food
-        closest_food = None
-        min_dist_sq = float('inf')
-        view_range_sq = 800**2
-        
+        vision_radius = 2000
+
+        def get_sector_index(dx, dy):
+            angle = math.atan2(dy, dx)
+            if angle < 0: angle += 2 * math.pi
+            idx = int((angle + math.pi/8) / (math.pi/4)) % 8
+            return idx
+
         for f in world.food:
-            d_sq = (f['x'] - cx)**2 + (f['y'] - cy)**2
-            if d_sq < view_range_sq and d_sq < min_dist_sq:
-                min_dist_sq = d_sq
-                closest_food = f
-        
-        if closest_food:
-            dx = closest_food['x'] - cx
-            dy = closest_food['y'] - cy
-            move_x += dx * self.genes['food_weight']
-            move_y += dy * self.genes['food_weight']
+            dx = f['x'] - cx
+            dy = f['y'] - cy
+            d_sq = dx*dx + dy*dy
+            if d_sq < vision_radius**2:
+                idx = get_sector_index(dx, dy)
+                sectors_food[idx] += 0.5
 
-        # 2. Players
-        nearest_prey_dist = float('inf')
-        for pid, p in world.players.items():
-            if pid == self.id or p.is_dead or p.is_spectator: continue
-            for cell in p.cells:
-                dx = cell.x - cx
-                dy = cell.y - cy
-                dist_sq = dx**2 + dy**2
-                dist = math.sqrt(dist_sq)
-                if dist > 1000: continue 
-                ratio = cell.mass / avg_mass
-                if ratio > 1.25:
-                    force = self.genes['predator_weight'] / (dist + 1) * 5000
-                    move_x -= (dx/dist) * force
-                    move_y -= (dy/dist) * force
-                elif avg_mass > cell.mass * 1.25:
-                    if dist < nearest_prey_dist: nearest_prey_dist = dist
-                    force = self.genes['prey_weight'] / (dist + 1) * 3000
-                    move_x += (dx/dist) * force
-                    move_y += (dy/dist) * force
+        nearest_teammate = None
+        min_tm_dist = float('inf')
+        nearest_enemy = None
+        min_en_dist = float('inf')
+        nearest_virus = None
+        min_v_dist = float('inf')
+
+        for p in world.players.values():
+            if p.id == self.id or p.is_dead: continue
+            
+            p_cx = sum(c.x for c in p.cells)/len(p.cells)
+            p_cy = sum(c.y for c in p.cells)/len(p.cells)
+            dx = p_cx - cx
+            dy = p_cy - cy
+            dist = math.sqrt(dx**2 + dy**2)
+
+            # 紀錄最近的隊友/敵人供後續特徵使用
+            if p.team_id == self.team_id:
+                if dist < min_tm_dist:
+                    min_tm_dist = dist
+                    nearest_teammate = p
+                # 隊友不計入視野威脅/獵物，而是單獨處理
+            else:
+                if dist < min_en_dist:
+                    min_en_dist = dist
+                    nearest_enemy = p
+                
+                if dist < vision_radius:
+                    idx = get_sector_index(dx, dy)
+                    if p.total_mass > my_mass * 1.2:
+                        sectors_threat[idx] += p.total_mass / my_mass
+                    elif my_mass > p.total_mass * 1.2:
+                        sectors_prey[idx] += p.total_mass / my_mass
 
         for v in world.viruses:
             dx = v.x - cx
             dy = v.y - cy
-            dist_sq = dx**2 + dy**2
-            if dist_sq < 600**2:
-                dist = math.sqrt(dist_sq)
-                if avg_mass > v.mass * 1.1:
-                    force = self.genes['virus_weight'] / (dist + 1) * 5000
-                    move_x -= (dx/dist) * force
-                    move_y -= (dy/dist) * force
+            dist = math.sqrt(dx*dx + dy*dy)
+            if dist < min_v_dist:
+                min_v_dist = dist
+                nearest_virus = v
+            # 病毒處理略... (同上)
 
-        edge_dist = 200
-        if cx < edge_dist: move_x += 500
-        if cx > MAP_WIDTH - edge_dist: move_x -= 500
-        if cy < edge_dist: move_y += 500
-        if cy > MAP_HEIGHT - edge_dist: move_y -= 500
+        # --- 3. 高階戰術特徵 (6) ---
+        
+        # 特徵 A: 聯合力量 (Combined Power)
+        # 如果 (我+隊友) > 敵人 * 1.3，這是一個進攻訊號
+        combined_power = 0.0
+        if nearest_teammate and nearest_enemy:
+            tm_mass = nearest_teammate.total_mass
+            en_mass = nearest_enemy.total_mass
+            if (my_mass + tm_mass) > en_mass * 1.3:
+                combined_power = 1.0
+        
+        # 特徵 B: 隊友對齊度 (Teammate Alignment)
+        # 向量點積：檢查 "我->隊友" 的方向是否與 "隊友->敵人" 的方向一致
+        # 如果一致，代表我們排成一列，適合 Tricksplit
+        alignment = 0.0
+        if nearest_teammate and nearest_enemy:
+            tm_cx = sum(c.x for c in nearest_teammate.cells)/len(nearest_teammate.cells)
+            tm_cy = sum(c.y for c in nearest_teammate.cells)/len(nearest_teammate.cells)
+            en_cx = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            en_cy = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            
+            v_me_tm = (tm_cx - cx, tm_cy - cy) # 我到隊友
+            v_tm_en = (en_cx - tm_cx, en_cy - tm_cy) # 隊友到敵人
+            
+            # 歸一化
+            mag1 = math.sqrt(v_me_tm[0]**2 + v_me_tm[1]**2)
+            mag2 = math.sqrt(v_tm_en[0]**2 + v_tm_en[1]**2)
+            if mag1 > 0 and mag2 > 0:
+                dot_product = (v_me_tm[0]*v_tm_en[0] + v_me_tm[1]*v_tm_en[1]) / (mag1 * mag2)
+                alignment = dot_product # 1.0 代表完美直線
 
-        self.mouse_x = cx + move_x
-        self.mouse_y = cy + move_y
+        # 特徵 C: 隊友需要餵食 (Support Needed)
+        # 如果隊友比我小很多，且就在附近
+        support_needed = 0.0
+        if nearest_teammate and min_tm_dist < 600:
+            if nearest_teammate.total_mass < my_mass * 0.4:
+                support_needed = 1.0
 
-        if (nearest_prey_dist < 400 and self.total_mass > 200 and 
-            len(self.cells) < MAX_CELLS and random.random() < (0.02 * self.genes['split_aggression'])):
+        # 特徵 D: 病毒攻擊機會 (Virus Shot)
+        # 我 + 病毒 + 敵人 連成一線
+        virus_shot_opp = 0.0
+        if nearest_virus and nearest_enemy and min_v_dist < 700:
+            v_x, v_y = nearest_virus.x, nearest_virus.y
+            en_x = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            en_y = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            
+            v1 = (v_x - cx, v_y - cy)
+            v2 = (en_x - v_x, en_y - v_y)
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            if mag1 > 0 and mag2 > 0:
+                if (v1[0]*v2[0] + v1[1]*v2[1]) / (mag1 * mag2) > 0.9: # 角度很正
+                    virus_shot_opp = 1.0
+
+        # 特徵 E: 隊友距離 (Teammate Proximity)
+        tm_prox = 0.0
+        if nearest_teammate:
+            tm_prox = 1.0 - min(min_tm_dist / 1500, 1.0)
+
+        # 特徵 F: 是否在隊友的「嘴邊」 (Feeding Angle)
+        # 用於判斷是否應該分裂撞向隊友
+        feed_angle = 0.0
+        if nearest_teammate and min_tm_dist < 400:
+             feed_angle = 1.0
+
+        tactical_inputs = [combined_power, alignment, support_needed, virus_shot_opp, tm_prox, feed_angle]
+        
+        final_input = np.concatenate((base_inputs, np.tanh(sectors_food), np.tanh(sectors_threat), np.tanh(sectors_prey), tactical_inputs))
+        return final_input
+
+    def think(self, world):
+        if self.is_dead:
+            self.on_death(world) # 傳入 world 以計算隊伍總分
+            self.spawn()
+            if self.team_id in BEST_BRAINS:
+                self.brain = BEST_BRAINS[self.team_id]['brain'].mutate()
+                self.generation = BEST_BRAINS[self.team_id]['gen'] + 1
+            self.max_mass_achieved = BASE_MASS
+            self.spawn_time = time.time()
+            self.stagnation_penalty = 0
+            return
+
+        # 呆滯檢查
+        now = time.time()
+        if now - self.last_pos_check > 5.0:
+            cx = sum(c.x for c in self.cells) / len(self.cells)
+            cy = sum(c.y for c in self.cells) / len(self.cells)
+            dist = math.sqrt((cx - self.last_pos_x)**2 + (cy - self.last_pos_y)**2)
+            if dist < 200:
+                self.stagnation_penalty += 1000 # 重罰
+                self.split() # 強制動作
+            self.last_pos_x = cx
+            self.last_pos_y = cy
+            self.last_pos_check = now
+
+        inputs = self.get_inputs(world)
+        outputs = self.brain.forward(inputs)
+        
+        move_x_raw, move_y_raw = outputs[0], outputs[1]
+        do_split = outputs[2] > 0.7
+        do_eject = outputs[3] > 0.7
+
+        cx = sum(c.x for c in self.cells) / len(self.cells)
+        cy = sum(c.y for c in self.cells) / len(self.cells)
+        
+        # 牆壁斥力
+        wall_force_x = 0
+        wall_force_y = 0
+        margin = 300
+        if cx < margin: wall_force_x = 1.0
+        if cx > MAP_WIDTH - margin: wall_force_x = -1.0
+        if cy < margin: wall_force_y = 1.0
+        if cy > MAP_HEIGHT - margin: wall_force_y = -1.0
+        
+        final_dir_x = move_x_raw + wall_force_x * 2.5
+        final_dir_y = move_y_raw + wall_force_y * 2.5
+        
+        self.mouse_x = cx + final_dir_x * 1000
+        self.mouse_y = cy + final_dir_y * 1000
+        
+        # 行動執行
+        if do_split and self.total_mass > 36 and len(self.cells) < MAX_CELLS:
+            # 降低隨機性，讓神經網路全權決定
+            # 如果輸入顯示 "Combined Power" 高，這裡應該會觸發
             self.split()
+        
+        if do_eject and self.total_mass > 36:
+            self.eject(world)
+
+    def on_death(self, world):
+        lifespan = time.time() - self.spawn_time
+        
+        # ★★★ 核心修改：計算隊伍總質量 ★★★
+        team_total_mass = 0
+        for p in world.players.values():
+            if p.team_id == self.team_id and not p.is_dead:
+                team_total_mass += p.total_mass
+        
+        # 分數 = 個人成就 + (隊伍成就 * 0.8)
+        # 這意味著：如果我死了，但我隊友現在有 10000 分，我也會得到很高的適應度分數
+        # 這會鼓勵 Bot 做出犧牲行為 (Tricksplit 餵給隊友)
+        score = (self.max_mass_achieved * 1.0) + (team_total_mass * 0.8) + (lifespan * 0.5) - self.stagnation_penalty
+        
+        current_best = BEST_BRAINS.get(self.team_id)
+        if current_best is None or score > current_best['score']:
+            BEST_BRAINS[self.team_id] = {
+                'brain': self.brain, 
+                'score': score,
+                'gen': self.generation
+            }
+            # print(f"Team {self.team_id} Gen {self.generation} Score {int(score)} (TeamMass contribution: {int(team_total_mass)})")
 
 class GameWorld:
     def __init__(self):
@@ -320,10 +539,10 @@ class GameWorld:
         self.food = []
         self.viruses = []
         self.ejected_mass = []
-        self.max_food = 500
-        self.food_spawn_rate = 5
+        self.max_food = 1500
+        self.food_spawn_rate = 20
         self.events = []
-        self.generate_food(200)
+        self.generate_food(800)
         self.generate_viruses(VIRUS_COUNT)
 
     def generate_food(self, amount):
@@ -333,12 +552,12 @@ class GameWorld:
                 'x': random.randint(0, MAP_WIDTH),
                 'y': random.randint(0, MAP_HEIGHT),
                 'color': "#%06x" % random.randint(0, 0xFFFFFF),
-                'mass': random.randint(2, 5)
+                'mass': random.randint(3, 8)
             })
             
     def generate_viruses(self, amount):
         for _ in range(amount):
-            self.viruses.append(Virus(random.randint(50, MAP_WIDTH-50), random.randint(50, MAP_HEIGHT-50)))
+            self.viruses.append(Virus(random.randint(100, MAP_WIDTH-100), random.randint(100, MAP_HEIGHT-100)))
 
     def resolve_player_collisions_and_merge(self, player):
         now = time.time()
@@ -363,8 +582,8 @@ class GameWorld:
                         c1.y = (c1.y * c1.mass + c2.y * c2.mass) / (c1.mass + c2.mass)
                         to_remove_indices.add(j)
                     else:
-                        if dist > 0:
-                            force = 20 * TICK_LEN
+                        if dist > 0: # 內部吸力
+                            force = 30 * TICK_LEN
                             nx, ny = dx/dist, dy/dist
                             c1.x -= nx * force
                             c1.y -= ny * force
@@ -375,7 +594,8 @@ class GameWorld:
                         if dist == 0: dist, dx = 1, 1
                         penetration = radius_sum - dist
                         nx, ny = dx/dist, dy/dist
-                        force = penetration * 0.5
+                        # 減少內部排斥力，允許細胞貼得更近，方便合球
+                        force = penetration * 1.0 
                         c1.x += nx * force
                         c1.y += ny * force
                         c2.x -= nx * force
@@ -409,6 +629,7 @@ class GameWorld:
 
         ejects_to_remove = set()
         viruses_to_add = []
+        
         for v_idx, v in enumerate(self.viruses):
             for e_idx, e in enumerate(self.ejected_mass):
                 if e_idx in ejects_to_remove: continue
@@ -425,23 +646,29 @@ class GameWorld:
                             v.y + math.sin(shot_angle) * start_dist,
                             mass=VIRUS_START_MASS, angle=shot_angle, velocity=VIRUS_SHOT_IMPULSE
                         ))
+
         self.ejected_mass = [e for i, e in enumerate(self.ejected_mass) if i not in ejects_to_remove]
         self.viruses.extend(viruses_to_add)
 
         for p in active_players:
             virus_hit_info = [] 
             for i, cell in enumerate(p.cells):
+                # 食物
                 for idx in range(len(self.food) - 1, -1, -1):
                     f = self.food[idx]
                     if (cell.x-f['x'])**2 + (cell.y-f['y'])**2 < cell.radius**2:
                         cell.mass += f['mass']
                         del self.food[idx]
+                
+                # 吐出質量
                 for idx in range(len(self.ejected_mass) - 1, -1, -1):
                     e = self.ejected_mass[idx]
-                    if e.parent_id == p.id and (now - e.birth_time < 0.5): continue
+                    if e.parent_id == p.id and (now - e.birth_time < 0.2): continue
                     if (cell.x-e.x)**2 + (cell.y-e.y)**2 < cell.radius**2:
                         cell.mass += e.mass
                         del self.ejected_mass[idx]
+                
+                # 病毒
                 for v_idx in range(len(self.viruses) - 1, -1, -1):
                     v = self.viruses[v_idx]
                     if cell.mass > v.mass * 1.1:
@@ -449,19 +676,41 @@ class GameWorld:
                             virus_hit_info.append((i, v.mass))
                             del self.viruses[v_idx]
                             break
+            
             virus_hit_info.sort(key=lambda x: x[0], reverse=True)
             for idx, v_mass in virus_hit_info:
                 p.explode_on_virus(idx, v_mass)
 
+        # ★★★ 吞噬邏輯 (允許隊友互吃) ★★★
         for p1 in active_players:
             for cell1 in p1.cells:
                 for p2 in active_players:
                     if p1.id == p2.id: continue
+                    
+                    # 判斷是否為隊友
+                    is_teammate = (p1.team_id == p2.team_id)
+                    
                     for cell2 in p2.cells:
                         dist = math.sqrt((cell1.x - cell2.x)**2 + (cell1.y - cell2.y)**2)
-                        if dist < cell1.radius and cell1.mass > cell2.mass * 1.25:
-                            cell1.mass += cell2.mass
-                            cell2.mass = 0
+                        if dist < cell1.radius:
+                            # 吃掉的條件
+                            can_eat = False
+                            
+                            if is_teammate:
+                                # 隊友互吃條件：
+                                # 1. 差距夠大 (大吃小加速)
+                                # 2. 或者被吃者剛出生不久 (剛分裂出來的小球)
+                                if cell1.mass > cell2.mass * 1.30: # 隊友需要 30% 差距
+                                    can_eat = True
+                            else:
+                                # 敵人互吃：25% 差距
+                                if cell1.mass > cell2.mass * 1.25:
+                                    can_eat = True
+                            
+                            if can_eat:
+                                cell1.mass += cell2.mass
+                                cell2.mass = 0 # 標記為死亡
+                    
                     p2.cells = [c for c in p2.cells if c.mass > 0]
                     if len(p2.cells) == 0: p2.is_dead = True
 
@@ -486,54 +735,44 @@ class GameWorld:
 world = GameWorld()
 pid_counter = 0
 
-# --- 中央伺服器通訊函數 ---
 async def register_to_master():
-    """向中央伺服器註冊"""
     try:
         async with aiohttp.ClientSession() as session:
-            data = {
-                'url': MY_URL,
-                'name': SERVER_NAME,
-                'max_players': MAX_PLAYERS
-            }
+            data = {'url': MY_URL, 'name': SERVER_NAME, 'max_players': MAX_PLAYERS}
             async with session.post(f"{MASTER_URL}/register", json=data) as resp:
-                if resp.status == 200:
-                    print("Successfully registered to Master Server")
-                else:
-                    print(f"Failed to register: {resp.status}")
+                print("Registered to Master")
     except Exception as e:
-        print(f"Master Server Error: {e}")
+        print(f"Master Error: {e}")
 
 async def deregister_from_master():
-    """向中央伺服器註銷"""
     try:
         async with aiohttp.ClientSession() as session:
-            data = {'url': MY_URL}
-            async with session.post(f"{MASTER_URL}/deregister", json=data) as resp:
-                print("Deregistered from Master Server")
-    except:
-        pass
+            await session.post(f"{MASTER_URL}/deregister", json={'url': MY_URL})
+    except: pass
 
 def manage_game_commands(cmd):
-    global pid_counter, MAP_WIDTH, MAP_HEIGHT
+    global pid_counter, MAP_WIDTH, MAP_HEIGHT, BEST_BRAINS
     
     if cmd[0] == "addbot" and len(cmd) > 1:
         try:
             n = int(cmd[1])
-            print(f"Adding {n} bots...")
+            print(f"Adding {n} Smart Bots...")
             for _ in range(n):
                 pid = pid_counter
                 pid_counter += 1
                 world.players[pid] = Bot(pid)
         except ValueError: print("Invalid number")
         
+    elif cmd[0] == "resetbrains":
+        BEST_BRAINS = {}
+        print("Brains reset.")
+
     elif cmd[0] == "removebot" and len(cmd) > 1:
         try:
             n = int(cmd[1])
-            print(f"Removing {n} bots...")
-            bots_to_remove = [pid for pid, p in world.players.items() if isinstance(p, Bot)]
-            for pid in bots_to_remove[:n]: del world.players[pid]
-        except ValueError: print("Invalid number")
+            bots = [pid for pid, p in world.players.items() if isinstance(p, Bot)]
+            for pid in bots[:n]: del world.players[pid]
+        except ValueError: print("Error")
 
     elif cmd[0] == "setsize" and len(cmd) == 3:
         try:
@@ -554,9 +793,9 @@ def manage_game_commands(cmd):
             world.food_spawn_rate = rate
             print(f"Food Config Updated: Max={max_f}, Rate={rate}")
         except ValueError: print("Usage: foodcfg <max_amount> <spawn_rate>")
-    
+
     else:
-        print("Commands: addbot, removebot, setsize, clearfood, foodcfg")
+        print("Commands: addbot, removebot, resetbrains, setsize, clearfood, foodcfg")
 
 async def input_loop():
     loop = asyncio.get_event_loop()
@@ -572,24 +811,13 @@ async def handler(websocket):
     pid = pid_counter
     pid_counter += 1
     current_player = None
-    
     try:
         async for message in websocket:
             data = json.loads(message)
-            
-            # 響應 Master 的 Ping
             if data['type'] == 'ping':
-                player_count = len([p for p in world.players.values() if not isinstance(p, Bot)])
-                await websocket.send(json.dumps({
-                    'type': 'pong', 
-                    'server_name': SERVER_NAME,
-                    'players': player_count,
-                    'max_players': MAX_PLAYERS
-                }))
-                
+                await websocket.send(json.dumps({'type':'pong', 'server_name': SERVER_NAME, 'players': len(world.players), 'max_players': MAX_PLAYERS}))
             elif data['type'] == 'join':
-                name = data.get('name', 'Guest')[:15]
-                current_player = Player(websocket, pid, name)
+                current_player = Player(websocket, pid, data.get('name', 'Guest')[:15])
                 world.players[pid] = current_player
                 await websocket.send(json.dumps({'type': 'init', 'id': pid, 'map': {'w': MAP_WIDTH, 'h': MAP_HEIGHT}}))
             elif data['type'] == 'spectate':
@@ -600,12 +828,9 @@ async def handler(websocket):
                 if data['type'] == 'input':
                     current_player.mouse_x = data['x']
                     current_player.mouse_y = data['y']
-                elif data['type'] == 'split':
-                    current_player.split()
-                elif data['type'] == 'eject':
-                    current_player.eject(world)
-                elif data['type'] == 'respawn' and current_player.is_dead:
-                    current_player.spawn()
+                elif data['type'] == 'split': current_player.split()
+                elif data['type'] == 'eject': current_player.eject(world)
+                elif data['type'] == 'respawn' and current_player.is_dead: current_player.spawn()
     except: pass
     finally:
         if pid in world.players and not isinstance(world.players[pid], Bot):
@@ -615,40 +840,31 @@ async def game_loop():
     while True:
         start = time.time()
         world.update()
-        
         msg_state = json.dumps({'type': 'update', 'data': world.get_state()})
         msg_events = []
         while world.events:
             event = world.events.pop(0)
             msg_events.append(json.dumps(event))
 
-        websockets_to_remove = []
+        to_del = []
         for pid, p in world.players.items():
             if isinstance(p, Bot): continue
             try: 
                 await p.websocket.send(msg_state)
                 for event_msg in msg_events:
                     await p.websocket.send(event_msg)
-            except: websockets_to_remove.append(pid)
-        
-        for pid in websockets_to_remove: del world.players[pid]
+            except: to_del.append(pid)
+        for pid in to_del: del world.players[pid]
         await asyncio.sleep(max(0, TICK_LEN - (time.time() - start)))
 
 async def main():
-    print(f"Agar.io Game Server v4.1 - {SERVER_NAME}")
-    
-    # 啟動時註冊
+    print(f"Pro-Team Neural Agar.io Server - {SERVER_NAME}")
     await register_to_master()
-    
     try:
         await asyncio.gather(game_loop(), websockets.serve(handler, SERVER_HOST, SERVER_PORT), input_loop())
     finally:
-        # 結束時註銷
         await deregister_from_master()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        # 強制註銷 (盡力而為)
-        asyncio.run(deregister_from_master())
+    try: asyncio.run(main())
+    except KeyboardInterrupt: asyncio.run(deregister_from_master())
