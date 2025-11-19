@@ -10,7 +10,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Pro-Team Strat Neural Server"
+SERVER_NAME = "Optimized Strat Server"
 SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
@@ -22,27 +22,25 @@ MAP_WIDTH = 6000
 MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.001 # 極低的衰減，鼓勵囤積質量
+MASS_DECAY_RATE = 0.001 
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
 MAX_CELLS = 16
-SPLIT_IMPULSE = 780    # 增加分裂推力，讓 Tricksplit 更猛
+SPLIT_IMPULSE = 780    
 EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 60
+VIRUS_COUNT = 50 # 稍微減少病毒數量以優化性能
 VIRUS_SHOT_IMPULSE = 850
 
 # --- 神經網路與進化參數 ---
-# 輸入層擴增至 36：
-# 6(基礎) + 24(扇形視野) + 6(高階戰術特徵)
 INPUT_SIZE = 36   
-HIDDEN_SIZE = 32  # 增加大腦容量以處理複雜戰術
-OUTPUT_SIZE = 4   # MoveX, MoveY, Split, Eject
+HIDDEN_SIZE = 32  
+OUTPUT_SIZE = 4   
 MUTATION_RATE = 0.1 
-MUTATION_STRENGTH = 0.4 # 強突變，嘗試激進策略
+MUTATION_STRENGTH = 0.4 
 
 # 全域基因庫
 BEST_BRAINS = {} 
@@ -68,17 +66,11 @@ class SimpleBrain:
 
     def forward(self, inputs):
         x = np.array(inputs)
-        # Layer 1
         z1 = np.dot(x, self.w1) + self.b1
         a1 = np.maximum(0, z1) # ReLU
-        
-        # Layer 2
         z2 = np.dot(a1, self.w2) + self.b2
-        
-        # Outputs
         move = np.tanh(z2[:2]) 
         actions = sigmoid(z2[2:])
-        
         return np.concatenate((move, actions))
 
     def mutate(self):
@@ -87,7 +79,6 @@ class SimpleBrain:
             if random.random() < MUTATION_RATE:
                 noise = np.random.randn(*param.shape) * MUTATION_STRENGTH
                 param += noise
-                # 隨機重置神經元連接，尋找新的戰術路徑
                 if random.random() < 0.01:
                     idx = random.randint(0, param.size - 1)
                     param.flat[idx] = random.gauss(0, 1)
@@ -98,7 +89,7 @@ class EjectedMass:
         self.id = random.randint(100000, 999999)
         self.x = x
         self.y = y
-        self.mass = 16 # 稍微增加 W 的質量
+        self.mass = 16 
         self.color = color
         self.radius = mass_to_radius(self.mass)
         self.vx = math.cos(angle) * EJECT_IMPULSE
@@ -153,8 +144,11 @@ class Cell:
         self.set_recombine_cooldown()
 
     def set_recombine_cooldown(self):
-        # 加快合球速度，方便快速傳遞質量
-        cooldown = 5 + (0.01 * self.mass) # 原本是 30 + 0.02
+        # ★★★ 修正：融合時間設定 ★★★
+        # 基礎 30 秒 + (0.02 * 質量)
+        # Mass 10 -> 30.2s
+        # Mass 1000 -> 50.0s
+        cooldown = 30 + (0.02 * self.mass)
         self.recombine_time = time.time() + cooldown
 
     @property
@@ -299,6 +293,9 @@ class Bot(Player):
         self.last_pos_x = 0
         self.last_pos_y = 0
         self.stagnation_penalty = 0
+        
+        # ★★★ 優化：記錄上次思考時間 ★★★
+        self.last_think_time = 0 
 
     def get_inputs(self, world):
         if not self.cells: return np.zeros(INPUT_SIZE)
@@ -308,7 +305,7 @@ class Bot(Player):
         my_mass = self.total_mass
         if my_mass > self.max_mass_achieved: self.max_mass_achieved = my_mass
 
-        # --- 1. 基礎資訊 (6) ---
+        # --- 1. 基礎資訊 ---
         norm_mass = min(my_mass / 10000, 1.0)
         dist_left = cx / MAP_WIDTH
         dist_right = (MAP_WIDTH - cx) / MAP_WIDTH
@@ -317,12 +314,13 @@ class Bot(Player):
         split_full = 1.0 if len(self.cells) >= MAX_CELLS else -1.0
         base_inputs = [norm_mass, dist_left, dist_right, dist_top, dist_bottom, split_full]
 
-        # --- 2. 扇形視野 (24) ---
+        # --- 2. 扇形視野 (優化版) ---
         sectors_food = np.zeros(8)
-        sectors_threat = np.zeros(8) # 比我大的敵人
-        sectors_prey = np.zeros(8)   # 比我小的敵人 (可吃)
+        sectors_threat = np.zeros(8)
+        sectors_prey = np.zeros(8)
         
         vision_radius = 2000
+        vision_radius_sq = vision_radius ** 2
 
         def get_sector_index(dx, dy):
             angle = math.atan2(dy, dx)
@@ -330,11 +328,17 @@ class Bot(Player):
             idx = int((angle + math.pi/8) / (math.pi/4)) % 8
             return idx
 
+        # 優化：不計算所有食物，只取部分或使用簡單距離檢查
+        # 為了性能，這裡仍然遍歷，但在外部減少了食物總量
         for f in world.food:
+            # 簡單矩形過濾 (比平方根快)
+            if abs(f['x'] - cx) > vision_radius or abs(f['y'] - cy) > vision_radius:
+                continue
+            
             dx = f['x'] - cx
             dy = f['y'] - cy
             d_sq = dx*dx + dy*dy
-            if d_sq < vision_radius**2:
+            if d_sq < vision_radius_sq:
                 idx = get_sector_index(dx, dy)
                 sectors_food[idx] += 0.5
 
@@ -348,112 +352,99 @@ class Bot(Player):
         for p in world.players.values():
             if p.id == self.id or p.is_dead: continue
             
+            # 計算玩家重心
             p_cx = sum(c.x for c in p.cells)/len(p.cells)
             p_cy = sum(c.y for c in p.cells)/len(p.cells)
+            
+            if abs(p_cx - cx) > vision_radius or abs(p_cy - cy) > vision_radius:
+                continue
+
             dx = p_cx - cx
             dy = p_cy - cy
-            dist = math.sqrt(dx**2 + dy**2)
+            dist_sq = dx*dx + dy*dy
+            dist = math.sqrt(dist_sq)
 
-            # 紀錄最近的隊友/敵人供後續特徵使用
             if p.team_id == self.team_id:
                 if dist < min_tm_dist:
                     min_tm_dist = dist
                     nearest_teammate = p
-                # 隊友不計入視野威脅/獵物，而是單獨處理
             else:
                 if dist < min_en_dist:
                     min_en_dist = dist
                     nearest_enemy = p
                 
-                if dist < vision_radius:
-                    idx = get_sector_index(dx, dy)
-                    if p.total_mass > my_mass * 1.2:
-                        sectors_threat[idx] += p.total_mass / my_mass
-                    elif my_mass > p.total_mass * 1.2:
-                        sectors_prey[idx] += p.total_mass / my_mass
+                idx = get_sector_index(dx, dy)
+                if p.total_mass > my_mass * 1.2:
+                    sectors_threat[idx] += p.total_mass / my_mass
+                elif my_mass > p.total_mass * 1.2:
+                    sectors_prey[idx] += p.total_mass / my_mass
 
         for v in world.viruses:
+            if abs(v.x - cx) > vision_radius or abs(v.y - cy) > vision_radius: continue
             dx = v.x - cx
             dy = v.y - cy
             dist = math.sqrt(dx*dx + dy*dy)
             if dist < min_v_dist:
                 min_v_dist = dist
                 nearest_virus = v
-            # 病毒處理略... (同上)
 
-        # --- 3. 高階戰術特徵 (6) ---
-        
-        # 特徵 A: 聯合力量 (Combined Power)
-        # 如果 (我+隊友) > 敵人 * 1.3，這是一個進攻訊號
+        # --- 3. 戰術特徵 ---
         combined_power = 0.0
         if nearest_teammate and nearest_enemy:
-            tm_mass = nearest_teammate.total_mass
-            en_mass = nearest_enemy.total_mass
-            if (my_mass + tm_mass) > en_mass * 1.3:
+            if (my_mass + nearest_teammate.total_mass) > nearest_enemy.total_mass * 1.3:
                 combined_power = 1.0
         
-        # 特徵 B: 隊友對齊度 (Teammate Alignment)
-        # 向量點積：檢查 "我->隊友" 的方向是否與 "隊友->敵人" 的方向一致
-        # 如果一致，代表我們排成一列，適合 Tricksplit
         alignment = 0.0
         if nearest_teammate and nearest_enemy:
             tm_cx = sum(c.x for c in nearest_teammate.cells)/len(nearest_teammate.cells)
             tm_cy = sum(c.y for c in nearest_teammate.cells)/len(nearest_teammate.cells)
             en_cx = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
             en_cy = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
-            
-            v_me_tm = (tm_cx - cx, tm_cy - cy) # 我到隊友
-            v_tm_en = (en_cx - tm_cx, en_cy - tm_cy) # 隊友到敵人
-            
-            # 歸一化
-            mag1 = math.sqrt(v_me_tm[0]**2 + v_me_tm[1]**2)
-            mag2 = math.sqrt(v_tm_en[0]**2 + v_tm_en[1]**2)
-            if mag1 > 0 and mag2 > 0:
-                dot_product = (v_me_tm[0]*v_tm_en[0] + v_me_tm[1]*v_tm_en[1]) / (mag1 * mag2)
-                alignment = dot_product # 1.0 代表完美直線
+            v1 = (tm_cx - cx, tm_cy - cy)
+            v2 = (en_cx - tm_cx, en_cy - tm_cy)
+            m1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            m2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            if m1 > 0 and m2 > 0:
+                alignment = (v1[0]*v2[0] + v1[1]*v2[1]) / (m1 * m2)
 
-        # 特徵 C: 隊友需要餵食 (Support Needed)
-        # 如果隊友比我小很多，且就在附近
         support_needed = 0.0
-        if nearest_teammate and min_tm_dist < 600:
-            if nearest_teammate.total_mass < my_mass * 0.4:
-                support_needed = 1.0
+        if nearest_teammate and min_tm_dist < 600 and nearest_teammate.total_mass < my_mass * 0.4:
+            support_needed = 1.0
 
-        # 特徵 D: 病毒攻擊機會 (Virus Shot)
-        # 我 + 病毒 + 敵人 連成一線
         virus_shot_opp = 0.0
         if nearest_virus and nearest_enemy and min_v_dist < 700:
-            v_x, v_y = nearest_virus.x, nearest_virus.y
-            en_x = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
-            en_y = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
-            
-            v1 = (v_x - cx, v_y - cy)
-            v2 = (en_x - v_x, en_y - v_y)
-            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
-            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
-            if mag1 > 0 and mag2 > 0:
-                if (v1[0]*v2[0] + v1[1]*v2[1]) / (mag1 * mag2) > 0.9: # 角度很正
-                    virus_shot_opp = 1.0
+            en_cx = sum(c.x for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            en_cy = sum(c.y for c in nearest_enemy.cells)/len(nearest_enemy.cells)
+            v1 = (nearest_virus.x - cx, nearest_virus.y - cy)
+            v2 = (en_cx - nearest_virus.x, en_cy - nearest_virus.y)
+            m1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            m2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            if m1 > 0 and m2 > 0 and (v1[0]*v2[0] + v1[1]*v2[1]) / (m1 * m2) > 0.9:
+                virus_shot_opp = 1.0
 
-        # 特徵 E: 隊友距離 (Teammate Proximity)
         tm_prox = 0.0
         if nearest_teammate:
             tm_prox = 1.0 - min(min_tm_dist / 1500, 1.0)
 
-        # 特徵 F: 是否在隊友的「嘴邊」 (Feeding Angle)
-        # 用於判斷是否應該分裂撞向隊友
         feed_angle = 0.0
         if nearest_teammate and min_tm_dist < 400:
              feed_angle = 1.0
 
         tactical_inputs = [combined_power, alignment, support_needed, virus_shot_opp, tm_prox, feed_angle]
         
-        final_input = np.concatenate((base_inputs, np.tanh(sectors_food), np.tanh(sectors_threat), np.tanh(sectors_prey), tactical_inputs))
-        return final_input
+        return np.concatenate((base_inputs, np.tanh(sectors_food), np.tanh(sectors_threat), np.tanh(sectors_prey), tactical_inputs))
 
     def think(self, world):
+        # ★★★ 性能優化核心：降低思考頻率 ★★★
+        # 每個 Bot 每 0.15 秒才思考一次 (約每秒 6-7 次)，而不是每秒 20 次
+        # 這大幅減少了 get_inputs 中的大量距離運算
+        now = time.time()
+        if now - self.last_think_time < 0.15: 
+            return 
+        self.last_think_time = now
+
         if self.is_dead:
-            self.on_death(world) # 傳入 world 以計算隊伍總分
+            self.on_death(world)
             self.spawn()
             if self.team_id in BEST_BRAINS:
                 self.brain = BEST_BRAINS[self.team_id]['brain'].mutate()
@@ -463,15 +454,14 @@ class Bot(Player):
             self.stagnation_penalty = 0
             return
 
-        # 呆滯檢查
-        now = time.time()
+        # 呆滯懲罰 (每 5 秒)
         if now - self.last_pos_check > 5.0:
             cx = sum(c.x for c in self.cells) / len(self.cells)
             cy = sum(c.y for c in self.cells) / len(self.cells)
             dist = math.sqrt((cx - self.last_pos_x)**2 + (cy - self.last_pos_y)**2)
             if dist < 200:
-                self.stagnation_penalty += 1000 # 重罰
-                self.split() # 強制動作
+                self.stagnation_penalty += 1000
+                self.split()
             self.last_pos_x = cx
             self.last_pos_y = cy
             self.last_pos_check = now
@@ -501,10 +491,7 @@ class Bot(Player):
         self.mouse_x = cx + final_dir_x * 1000
         self.mouse_y = cy + final_dir_y * 1000
         
-        # 行動執行
         if do_split and self.total_mass > 36 and len(self.cells) < MAX_CELLS:
-            # 降低隨機性，讓神經網路全權決定
-            # 如果輸入顯示 "Combined Power" 高，這裡應該會觸發
             self.split()
         
         if do_eject and self.total_mass > 36:
@@ -512,16 +499,11 @@ class Bot(Player):
 
     def on_death(self, world):
         lifespan = time.time() - self.spawn_time
-        
-        # ★★★ 核心修改：計算隊伍總質量 ★★★
         team_total_mass = 0
         for p in world.players.values():
             if p.team_id == self.team_id and not p.is_dead:
                 team_total_mass += p.total_mass
         
-        # 分數 = 個人成就 + (隊伍成就 * 0.8)
-        # 這意味著：如果我死了，但我隊友現在有 10000 分，我也會得到很高的適應度分數
-        # 這會鼓勵 Bot 做出犧牲行為 (Tricksplit 餵給隊友)
         score = (self.max_mass_achieved * 1.0) + (team_total_mass * 0.8) + (lifespan * 0.5) - self.stagnation_penalty
         
         current_best = BEST_BRAINS.get(self.team_id)
@@ -531,7 +513,6 @@ class Bot(Player):
                 'score': score,
                 'gen': self.generation
             }
-            # print(f"Team {self.team_id} Gen {self.generation} Score {int(score)} (TeamMass contribution: {int(team_total_mass)})")
 
 class GameWorld:
     def __init__(self):
@@ -539,10 +520,11 @@ class GameWorld:
         self.food = []
         self.viruses = []
         self.ejected_mass = []
-        self.max_food = 1500
-        self.food_spawn_rate = 20
+        # ★★★ 優化：減少最大食物數量 (減少迴圈運算)，增加單體質量 ★★★
+        self.max_food = 800 # 原本 1500 -> 800，大幅減少延遲
+        self.food_spawn_rate = 10
         self.events = []
-        self.generate_food(800)
+        self.generate_food(500)
         self.generate_viruses(VIRUS_COUNT)
 
     def generate_food(self, amount):
@@ -552,7 +534,8 @@ class GameWorld:
                 'x': random.randint(0, MAP_WIDTH),
                 'y': random.randint(0, MAP_HEIGHT),
                 'color': "#%06x" % random.randint(0, 0xFFFFFF),
-                'mass': random.randint(3, 8)
+                # 增加質量補償數量減少
+                'mass': random.randint(5, 10) 
             })
             
     def generate_viruses(self, amount):
@@ -582,7 +565,7 @@ class GameWorld:
                         c1.y = (c1.y * c1.mass + c2.y * c2.mass) / (c1.mass + c2.mass)
                         to_remove_indices.add(j)
                     else:
-                        if dist > 0: # 內部吸力
+                        if dist > 0:
                             force = 30 * TICK_LEN
                             nx, ny = dx/dist, dy/dist
                             c1.x -= nx * force
@@ -594,7 +577,6 @@ class GameWorld:
                         if dist == 0: dist, dx = 1, 1
                         penetration = radius_sum - dist
                         nx, ny = dx/dist, dy/dist
-                        # 減少內部排斥力，允許細胞貼得更近，方便合球
                         force = penetration * 1.0 
                         c1.x += nx * force
                         c1.y += ny * force
@@ -653,14 +635,12 @@ class GameWorld:
         for p in active_players:
             virus_hit_info = [] 
             for i, cell in enumerate(p.cells):
-                # 食物
                 for idx in range(len(self.food) - 1, -1, -1):
                     f = self.food[idx]
                     if (cell.x-f['x'])**2 + (cell.y-f['y'])**2 < cell.radius**2:
                         cell.mass += f['mass']
                         del self.food[idx]
                 
-                # 吐出質量
                 for idx in range(len(self.ejected_mass) - 1, -1, -1):
                     e = self.ejected_mass[idx]
                     if e.parent_id == p.id and (now - e.birth_time < 0.2): continue
@@ -668,7 +648,6 @@ class GameWorld:
                         cell.mass += e.mass
                         del self.ejected_mass[idx]
                 
-                # 病毒
                 for v_idx in range(len(self.viruses) - 1, -1, -1):
                     v = self.viruses[v_idx]
                     if cell.mass > v.mass * 1.1:
@@ -681,35 +660,27 @@ class GameWorld:
             for idx, v_mass in virus_hit_info:
                 p.explode_on_virus(idx, v_mass)
 
-        # ★★★ 吞噬邏輯 (允許隊友互吃) ★★★
         for p1 in active_players:
             for cell1 in p1.cells:
                 for p2 in active_players:
                     if p1.id == p2.id: continue
                     
-                    # 判斷是否為隊友
                     is_teammate = (p1.team_id == p2.team_id)
                     
                     for cell2 in p2.cells:
                         dist = math.sqrt((cell1.x - cell2.x)**2 + (cell1.y - cell2.y)**2)
                         if dist < cell1.radius:
-                            # 吃掉的條件
                             can_eat = False
-                            
                             if is_teammate:
-                                # 隊友互吃條件：
-                                # 1. 差距夠大 (大吃小加速)
-                                # 2. 或者被吃者剛出生不久 (剛分裂出來的小球)
-                                if cell1.mass > cell2.mass * 1.30: # 隊友需要 30% 差距
+                                if cell1.mass > cell2.mass * 1.30: 
                                     can_eat = True
                             else:
-                                # 敵人互吃：25% 差距
                                 if cell1.mass > cell2.mass * 1.25:
                                     can_eat = True
                             
                             if can_eat:
                                 cell1.mass += cell2.mass
-                                cell2.mass = 0 # 標記為死亡
+                                cell2.mass = 0
                     
                     p2.cells = [c for c in p2.cells if c.mass > 0]
                     if len(p2.cells) == 0: p2.is_dead = True
@@ -858,7 +829,7 @@ async def game_loop():
         await asyncio.sleep(max(0, TICK_LEN - (time.time() - start)))
 
 async def main():
-    print(f"Pro-Team Neural Agar.io Server - {SERVER_NAME}")
+    print(f"Optimized Neural Agar.io Server - {SERVER_NAME}")
     await register_to_master()
     try:
         await asyncio.gather(game_loop(), websockets.serve(handler, SERVER_HOST, SERVER_PORT), input_loop())
