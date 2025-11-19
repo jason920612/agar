@@ -72,8 +72,10 @@
         let isDarkTheme = true;
         
         let mouseX = 0, mouseY = 0;
-        let isPlaying = false, isSpectating = false, isDead = true; // 新增 isDead 狀態
+        let isPlaying = false, isSpectating = false, isDead = true; 
         let servers = [], currentServerUrl = null;
+        
+        let specFollowMode = true; 
 
         async function fetchServerList() {
             const c = document.getElementById('serverListContainer');
@@ -96,7 +98,13 @@
         function renderServerList() { fetchServerList(); } 
 
         function connect() {
-            if(socket) socket.close();
+            // ★★★ 核心修復：在關閉舊連線前，先移除 onclose 監聽器，防止誤觸發斷線邏輯 ★★★
+            if(socket) {
+                socket.onclose = null; // 這行是關鍵，防止舊連線關閉時觸發 "Disconnected"
+                socket.close();
+            }
+            // ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+
             if(!currentServerUrl) return;
             socket = new WebSocket(currentServerUrl);
             socket.onopen = () => { console.log("Connected"); };
@@ -105,7 +113,17 @@
                 if(msg.type === 'init') { myId = msg.id; mapSize = msg.map; }
                 else if(msg.type === 'update') { processUpdate(msg.data); }
             };
-            socket.onclose = () => { setTimeout(connect, 2000); };
+            
+            // 斷線邏輯：只有當前正在使用的 socket 真的斷線時才會觸發
+            socket.onclose = () => { 
+                console.log("Disconnected - Reconnecting...");
+                isPlaying = false;
+                isSpectating = false;
+                isDead = true;
+                localPlayers = {}; 
+                showMenu("Play Game"); 
+                setTimeout(connect, 2000); 
+            };
         }
 
         function processUpdate(data) {
@@ -120,13 +138,13 @@
                 activeIds.add(p.id);
                 if(p.id === myId) {
                     if (p.dead) {
-                        isDead = true; // 標記死亡
-                        if (isPlaying) { // 如果還在遊玩狀態，切換為死亡選單
+                        isDead = true; 
+                        if (isPlaying) { 
                             isPlaying = false;
                             showMenu("Respawn");
                         }
                     } else {
-                        isDead = false; // 活著
+                        isDead = false; 
                     }
                 }
                 
@@ -141,20 +159,17 @@
             Object.keys(localPlayers).forEach(id => { if(!activeIds.has(parseInt(id))) delete localPlayers[id]; });
         }
 
-        // ★★★ 核心邏輯修復：按鈕行為 ★★★
         function showMenu(playText) {
             document.getElementById('menuOverlay').style.display = 'flex';
             document.getElementById('playBtn').innerText = playText;
         }
 
         document.getElementById('playBtn').onclick = () => {
-            // 如果正在遊玩且沒死，按 Play 只是關閉選單 (Resume)
             if (isPlaying && !isDead) {
                 document.getElementById('menuOverlay').style.display = 'none';
                 return;
             }
             
-            // 否則發送加入請求 (Respawn)
             const name = document.getElementById('nickname').value || "Guest";
             socket.send(JSON.stringify({ type: 'join', name: name }));
             isPlaying = true; 
@@ -166,6 +181,7 @@
         document.getElementById('specBtn').onclick = () => {
             socket.send(JSON.stringify({ type: 'spectate' }));
             isPlaying = false; isSpectating = true;
+            specFollowMode = true; 
             document.getElementById('menuOverlay').style.display = 'none';
         };
 
@@ -178,13 +194,16 @@
             if (e.code === 'Escape') {
                 const menu = document.getElementById('menuOverlay');
                 if (menu.style.display === 'none') {
-                    // 開啟選單時，根據狀態改變按鈕文字
                     showMenu(isPlaying && !isDead ? "Resume Game" : "Play Game");
                 } else {
-                    // 只有活著的時候可以按 ESC 關閉選單
                     if (isPlaying && !isDead) menu.style.display = 'none';
                 }
             }
+            
+            if (e.code === 'KeyQ' && isSpectating) {
+                specFollowMode = !specFollowMode;
+            }
+
             if (!isPlaying || isDead) return;
             if (e.code === 'Space') socket.send(JSON.stringify({ type: 'split' }));
             if (e.code === 'KeyW') socket.send(JSON.stringify({ type: 'eject' }));
@@ -203,13 +222,20 @@
             mouseY = (e.clientY - rect.top - canvas.height/2) / camScale + camY;
         });
 
-        // ★★★ 核心修復：防止傳送 NaN 導致卡住 ★★★
         setInterval(() => {
-            if(socket && socket.readyState === 1 && isPlaying) {
-                // 確保座標是有效數字，否則使用地圖中心或當前攝像機位置
-                const safeX = isNaN(mouseX) ? mapSize.w/2 : mouseX;
-                const safeY = isNaN(mouseY) ? mapSize.h/2 : mouseY;
-                socket.send(JSON.stringify({ type: 'input', x: safeX, y: safeY }));
+            if(socket && socket.readyState === 1) {
+                let tx, ty;
+                if (isPlaying) {
+                    tx = isNaN(mouseX) ? mapSize.w/2 : mouseX;
+                    ty = isNaN(mouseY) ? mapSize.h/2 : mouseY;
+                } else if (isSpectating) {
+                    tx = camX;
+                    ty = camY;
+                }
+
+                if (tx !== undefined && ty !== undefined) {
+                    socket.send(JSON.stringify({ type: 'input', x: tx, y: ty }));
+                }
             }
         }, 50);
 
@@ -227,13 +253,19 @@
                     center.x += c.x; center.y += c.y; center.count++;
                     myTotalMass += c.m;
                 });
-            } else if(isSpectating && gameState.leaderboard.length > 0) {
-                const topId = gameState.leaderboard[0].id;
-                if(localPlayers[topId]) {
-                    const p = localPlayers[topId];
-                    p.renderCells.forEach(c => { center.x += c.x; center.y += c.y; center.count++; });
+            } else if(isSpectating) {
+                if (specFollowMode && gameState.leaderboard.length > 0) {
+                    const topId = gameState.leaderboard[0].id;
+                    if(localPlayers[topId]) {
+                        const p = localPlayers[topId];
+                        p.renderCells.forEach(c => { center.x += c.x; center.y += c.y; center.count++; });
+                    } else {
+                        center.x = camX; center.y = camY; center.count=1;
+                    }
                 } else {
-                    center.x = mapSize.w/2; center.y = mapSize.h/2; center.count=1;
+                    center.x = camX + (mouseX - camX) * 0.1; 
+                    center.y = camY + (mouseY - camY) * 0.1;
+                    center.count = 1;
                 }
             }
 
@@ -242,6 +274,11 @@
                 const ty = center.y / center.count;
                 camX += (tx - camX) * 0.1;
                 camY += (ty - camY) * 0.1;
+            }
+            
+            if (isSpectating && !specFollowMode) {
+                 camX = Math.max(0, Math.min(mapSize.w, camX));
+                 camY = Math.max(0, Math.min(mapSize.h, camY));
             }
 
             if (myTotalMass > 0) {
@@ -306,7 +343,13 @@
                 }
             });
             ctx.restore();
-            document.getElementById('massDisplay').innerText = Math.floor(myTotalMass);
+            
+            let specText = "";
+            if (isSpectating) {
+                specText = specFollowMode ? "(Spectating: Top Player - Q to Free)" : "(Spectating: Free Roam - Q to Follow)";
+            }
+            document.getElementById('massDisplay').innerText = isPlaying ? Math.floor(myTotalMass) : specText;
+            
             requestAnimationFrame(draw);
         }
         function updateLeaderboard() {

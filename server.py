@@ -10,7 +10,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Stable Event-Driven Server"
+SERVER_NAME = "Physics Optimized Server"
 SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
@@ -138,19 +138,21 @@ class Cell(GameObject):
     def apply_force(self, fx, fy):
         self.boost_x += fx; self.boost_y += fy
     def move(self, tx, ty):
-        # ★★★ 防呆：如果目標座標無效，就不移動 ★★★
         if math.isnan(tx) or math.isnan(ty): return
         dx, dy = tx - self.x, ty - self.y
         dist = math.sqrt(dx**2 + dy**2)
-        base_speed = 300 * (self.mass ** -0.2)
+        base_speed = 300 * (self.mass ** -0.2) # 質量越大移動越慢
         if dist > 0:
             speed = min(dist * 5, base_speed)
             self.x += (dx/dist) * speed * TICK_LEN
             self.y += (dy/dist) * speed * TICK_LEN
+        
+        # 慣性滑行邏輯
         self.x += self.boost_x * TICK_LEN
         self.y += self.boost_y * TICK_LEN
         self.boost_x *= FRICTION
         self.boost_y *= FRICTION
+        
     def decay(self):
         if self.mass > BASE_MASS:
             self.mass -= self.mass * MASS_DECAY_RATE * TICK_LEN
@@ -172,6 +174,10 @@ class Player:
     def total_mass(self): return sum([c.mass for c in self.cells])
     @property
     def center(self):
+        # --- 修改: 觀戰模式下，視野中心由客戶端的 mouse_x/y 決定 (自由移動或跟隨由前端傳送的座標決定) ---
+        if self.is_spectator:
+            return (self.mouse_x, self.mouse_y)
+        # -----------------------------------------------------------------------------
         if not self.cells: return (MAP_WIDTH/2, MAP_HEIGHT/2)
         return (sum(c.x for c in self.cells)/len(self.cells), sum(c.y for c in self.cells)/len(self.cells))
     def spawn(self):
@@ -293,9 +299,11 @@ class GameWorld:
                         self.event_queue.append({'type': GameEvent.EAT_EJECTED, 'cell': cell, 'ejected': e})
 
                 for v in self.viruses:
+                    # 吃病毒邏輯：只有足夠大的細胞才會吃掉病毒
                     if cell.mass > v.mass * 1.1 and (cell.x-v.x)**2 + (cell.y-v.y)**2 < cell.radius**2:
                         self.event_queue.append({'type': GameEvent.EAT_VIRUS, 'player': p, 'cell_idx': p.cells.index(cell), 'virus': v})
 
+        # 細胞碰撞處理 (柔體模擬簡化版)
         for p1 in active_players:
             to_merge = []
             for i in range(len(p1.cells)):
@@ -303,14 +311,20 @@ class GameWorld:
                     c1, c2 = p1.cells[i], p1.cells[j]
                     dist = math.sqrt((c1.x-c2.x)**2 + (c1.y-c2.y)**2)
                     if dist < c1.radius + c2.radius:
+                        # 合併檢查
                         if now > c1.recombine_time and now > c2.recombine_time and dist < (c1.radius+c2.radius)*0.65:
                             self.event_queue.append({'type': GameEvent.MERGE_CELLS, 'player': p1, 'idx1': i, 'idx2': j})
                         elif dist < c1.radius + c2.radius: 
+                             # 物理推擠：防止完全重疊
                              pen = (c1.radius+c2.radius) - dist
                              if dist == 0: dist, dx, dy = 1, 1, 0
                              else: dx, dy = (c1.x-c2.x)/dist, (c1.y-c2.y)/dist
-                             c1.x += dx*pen*0.5; c1.y += dy*pen*0.5
-                             c2.x -= dx*pen*0.5; c2.y -= dy*pen*0.5
+                             # 根據質量分配推擠力，質量大的推不動
+                             f = 0.5
+                             c1.x += dx * pen * f
+                             c1.y += dy * pen * f
+                             c2.x -= dx * pen * f
+                             c2.y -= dy * pen * f
             
             for p2 in active_players:
                 if p1.id == p2.id: continue
@@ -354,6 +368,7 @@ class GameWorld:
                 if prey.mass > 0: 
                     e['predator'].mass += prey.mass
                     prey.mass = 0 
+            
             elif t == GameEvent.SPLIT_CELL:
                 p = e['player']
                 if len(p.cells) < MAX_CELLS:
@@ -363,12 +378,31 @@ class GameWorld:
                             split_mass = c.mass / 2
                             c.mass = split_mass
                             c.set_recombine_cooldown()
+                            
+                            # [物理優化] 計算發射角度
                             dx, dy = p.mouse_x - c.x, p.mouse_y - c.y
                             ang = math.atan2(dy, dx)
-                            nc = Cell(c.x, c.y, split_mass, c.color)
-                            nc.apply_force(math.cos(ang)*SPLIT_IMPULSE, math.sin(ang)*SPLIT_IMPULSE)
+                            cos_a = math.cos(ang)
+                            sin_a = math.sin(ang)
+
+                            # [物理優化] 母細胞後座力 (Recoil)
+                            # 模擬擠出時的反作用力，母細胞稍微後退
+                            recoil_force = 200
+                            c.apply_force(-cos_a * recoil_force, -sin_a * recoil_force)
+
+                            # [物理優化] 子細胞生成位置 (Perimeter Spawning)
+                            # 讓子細胞直接在母細胞半徑邊緣生成，而不是中心，創造"擠出"感
+                            spawn_dist = c.radius
+                            nx = c.x + cos_a * spawn_dist
+                            ny = c.y + sin_a * spawn_dist
+                            
+                            nc = Cell(nx, ny, split_mass, c.color)
+                            
+                            # 給予子細胞巨大的初速度
+                            nc.apply_force(cos_a * SPLIT_IMPULSE, sin_a * SPLIT_IMPULSE)
                             new_cells.append(nc)
                     p.cells.extend(new_cells)
+            
             elif t == GameEvent.EJECT_MASS:
                 p = e['player']
                 for c in p.cells:
@@ -376,7 +410,16 @@ class GameWorld:
                         c.mass -= 16
                         dx, dy = p.mouse_x - c.x, p.mouse_y - c.y
                         ang = math.atan2(dy, dx)
-                        self.ejected_mass.append(EjectedMass(c.x+math.cos(ang)*c.radius, c.y+math.sin(ang)*c.radius, ang, c.color, p.id, p.team_id))
+                        cos_a, sin_a = math.cos(ang), math.sin(ang)
+                        
+                        # [物理優化] 吐球時給予母細胞反作用力 (動量守恆感)
+                        c.apply_force(-cos_a * 100, -sin_a * 100)
+                        
+                        # 生成噴射物
+                        ej_x = c.x + cos_a * c.radius
+                        ej_y = c.y + sin_a * c.radius
+                        self.ejected_mass.append(EjectedMass(ej_x, ej_y, ang, c.color, p.id, p.team_id))
+            
             elif t == GameEvent.EAT_VIRUS:
                 v = e['virus']
                 if v.id not in removed_viruses:
@@ -385,23 +428,31 @@ class GameWorld:
                     c.mass += v.mass
                     removed_viruses.add(v.id)
                     if v in self.viruses: self.viruses.remove(v)
+                    
+                    # 病毒爆炸分裂邏輯
                     if len(p.cells) < MAX_CELLS:
-                         pieces = min(MAX_CELLS - len(p.cells), 7)
-                         pmass = c.mass / (pieces + 1)
-                         c.mass = pmass; c.set_recombine_cooldown()
-                         for i in range(pieces):
-                             ang = (i/pieces)*math.pi*2
-                             nc = Cell(c.x, c.y, pmass, c.color)
-                             nc.apply_force(math.cos(ang)*SPLIT_IMPULSE, math.sin(ang)*SPLIT_IMPULSE)
-                             p.cells.append(nc)
+                         pieces = min(MAX_CELLS - len(p.cells), 7) # 最多炸成16塊
+                         if pieces > 0:
+                            pmass = c.mass / (pieces + 1)
+                            c.mass = pmass; c.set_recombine_cooldown()
+                            for i in range(pieces):
+                                # [物理優化] 環狀爆炸，但帶有隨機性看起來更像細胞破裂
+                                ang = (i/pieces) * math.pi * 2 + random.uniform(-0.5, 0.5)
+                                spawn_dist = c.radius * 0.8
+                                nx = c.x + math.cos(ang) * spawn_dist
+                                ny = c.y + math.sin(ang) * spawn_dist
+                                nc = Cell(nx, ny, pmass, c.color)
+                                nc.apply_force(math.cos(ang)*SPLIT_IMPULSE, math.sin(ang)*SPLIT_IMPULSE)
+                                p.cells.append(nc)
             elif t == GameEvent.MERGE_CELLS:
                 p = e['player']
                 try:
                     c1, c2 = p.cells[e['idx1']], p.cells[e['idx2']]
                     if c1.mass > 0 and c2.mass > 0:
                         c1.mass += c2.mass
-                        c1.x = (c1.x + c2.x)/2
-                        c1.y = (c1.y + c2.y)/2
+                        # 融合時取重心
+                        c1.x = (c1.x * c1.mass + c2.x * c2.mass) / (c1.mass + c2.mass)
+                        c1.y = (c1.y * c1.mass + c2.y * c2.mass) / (c1.mass + c2.mass)
                         c2.mass = 0 
                 except: pass
             elif t == GameEvent.VIRUS_SPLIT:
@@ -413,8 +464,12 @@ class GameWorld:
                     if ej in self.ejected_mass: self.ejected_mass.remove(ej)
                     if v.mass >= VIRUS_MAX_MASS:
                         v.mass = VIRUS_START_MASS
-                        ang = math.atan2(ej.vy, ej.vx)
-                        self.viruses.append(Virus(v.x+math.cos(ang)*v.radius*2, v.y+math.sin(ang)*v.radius*2, VIRUS_START_MASS, ang, VIRUS_SHOT_IMPULSE))
+                        # [物理優化] 病毒發射時沿著最後一顆球的軌跡射出
+                        shoot_ang = math.atan2(ej.vy, ej.vx)
+                        # 在前方生成新的病毒
+                        nx = v.x + math.cos(shoot_ang) * (v.radius * 2.5)
+                        ny = v.y + math.sin(shoot_ang) * (v.radius * 2.5)
+                        self.viruses.append(Virus(nx, ny, VIRUS_START_MASS, shoot_ang, VIRUS_SHOT_IMPULSE))
 
         for p in self.players.values():
             p.cells = [c for c in p.cells if c.mass > 0]
@@ -430,8 +485,17 @@ class GameWorld:
         visible_players = []
         for p in self.players.values():
             if p.is_dead or p.is_spectator: continue
-            if any((c.x-cx)**2 + (c.y-cy)**2 < v_rad_sq for c in p.cells):
-                visible_players.append({'id': p.id, 'name': p.name, 'dead': p.is_dead, 'cells': [{'x': int(c.x), 'y': int(c.y), 'm': int(c.mass), 'c': c.color} for c in p.cells]})
+            # 優化：檢查每個細胞是否在視野內
+            p_cells = []
+            in_view = False
+            for c in p.cells:
+                if (c.x-cx)**2 + (c.y-cy)**2 < v_rad_sq:
+                    in_view = True
+                # 傳送細胞位置與半徑，前端不再需要計算半徑
+                p_cells.append({'x': int(c.x), 'y': int(c.y), 'm': int(c.mass), 'c': c.color})
+            
+            if in_view:
+                visible_players.append({'id': p.id, 'name': p.name, 'dead': p.is_dead, 'cells': p_cells})
         
         visible_food = []
         min_gx, max_gx = max(0, int((cx-v_rad)//GRID_SIZE)), min(int(MAP_WIDTH//GRID_SIZE), int((cx+v_rad)//GRID_SIZE))
@@ -527,12 +591,19 @@ async def handler(ws):
                 await ws.send(json.dumps({'type':'init', 'id':pid, 'map':{'w':MAP_WIDTH, 'h':MAP_HEIGHT}}))
             elif player and not player.is_spectator:
                 if data['type'] == 'input': 
-                    # ★★★ 防呆：檢查輸入數據，如果為 NaN 或 None 則忽略 ★★★
                     tx, ty = data.get('x'), data.get('y')
                     if tx is not None and ty is not None and not math.isnan(tx) and not math.isnan(ty):
                         player.mouse_x, player.mouse_y = tx, ty
                 elif data['type'] == 'split': world.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': player})
                 elif data['type'] == 'eject': world.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': player})
+            # --- 新增：允許觀戰者傳送位置訊息，以便更新視野 ---
+            elif player and player.is_spectator:
+                 if data['type'] == 'input':
+                    tx, ty = data.get('x'), data.get('y')
+                    if tx is not None and ty is not None and not math.isnan(tx) and not math.isnan(ty):
+                        player.mouse_x, player.mouse_y = tx, ty
+            # -------------------------------------------------
+
     except: pass
     finally: 
         if pid in world.players: del world.players[pid]
@@ -543,16 +614,26 @@ async def game_loop():
         world.update()
         for pid, p in world.players.items():
             if isinstance(p, Bot): continue
-            try: await p.ws.send(json.dumps({'type':'update', 'data': world.get_view_state(p)}))
-            except: pass
-        await asyncio.sleep(max(0, TICK_LEN - (time.time()-t1)))
+            try: 
+                await p.ws.send(json.dumps({'type':'update', 'data': world.get_view_state(p)}))
+            except websockets.exceptions.ConnectionClosed:
+                pass 
+            except Exception as e:
+                print(f"Send Error: {e}") 
+
+        process_time = time.time() - t1
+        delay = TICK_LEN - process_time
+        await asyncio.sleep(max(0.001, delay))
 
 async def main():
     print(f"Running {SERVER_NAME} on {SERVER_PORT}")
     try:
         async with aiohttp.ClientSession() as s: await s.post(f"{MASTER_URL}/register", json={'url':MY_URL, 'name':SERVER_NAME, 'max_players':MAX_PLAYERS})
     except: pass
-    await asyncio.gather(websockets.serve(handler, SERVER_HOST, SERVER_PORT), game_loop(), input_loop())
+    
+    server = websockets.serve(handler, SERVER_HOST, SERVER_PORT, ping_interval=None, ping_timeout=None)
+    
+    await asyncio.gather(server, game_loop(), input_loop())
 
 if __name__ == "__main__":
     try: asyncio.run(main())
