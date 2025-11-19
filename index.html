@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>Agar.io - Neural Client (Fixed Respawn)</title>
+    <title>Agar.io - Neural Client (Final)</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #111; font-family: 'Segoe UI', sans-serif; user-select: none; transition: background 0.3s; }
         canvas { display: block; }
@@ -107,10 +107,8 @@
             
             socket = new WebSocket(currentServerUrl);
             
-            // ★★★ 修復重點 1：連線成功時，強制重置狀態為死亡/未遊玩 ★★★
             socket.onopen = () => { 
                 console.log("Connected to " + currentServerUrl);
-                // 強制狀態重置，確保 UI 回到初始狀態
                 isPlaying = false;
                 isSpectating = false;
                 isDead = true;
@@ -127,9 +125,7 @@
                 else if(msg.type === 'update') { 
                     processUpdate(msg.data); 
                 }
-                // ★★★ 修復重點 2：處理伺服器發送的死亡通知 ★★★
                 else if (msg.type === 'death') {
-                    console.log("Received Death Notification");
                     isDead = true;
                     isPlaying = false;
                     isSpectating = false;
@@ -161,7 +157,6 @@
             const activeIds = new Set();
             data.players.forEach(p => {
                 activeIds.add(p.id);
-                // 這裡保留基本的檢查，但主要的死亡邏輯現在由 'death' 事件處理
                 if(!localPlayers[p.id]) localPlayers[p.id] = { ...p, renderCells: p.cells.map(c=>({...c})) };
                 else {
                     localPlayers[p.id].targetCells = p.cells;
@@ -183,10 +178,8 @@
                 document.getElementById('menuOverlay').style.display = 'none';
                 return;
             }
-            
             const name = document.getElementById('nickname').value || "Guest";
             socket.send(JSON.stringify({ type: 'join', name: name }));
-            // 暫時設為 true，但實際是否活著依賴 server 回應
             isPlaying = true; 
             isSpectating = false;
             isDead = false;
@@ -214,11 +207,7 @@
                     if (isPlaying && !isDead) menu.style.display = 'none';
                 }
             }
-            
-            if (e.code === 'KeyQ' && isSpectating) {
-                specFollowMode = !specFollowMode;
-            }
-
+            if (e.code === 'KeyQ' && isSpectating) specFollowMode = !specFollowMode;
             if (!isPlaying || isDead) return;
             if (e.code === 'Space') socket.send(JSON.stringify({ type: 'split' }));
             if (e.code === 'KeyW') socket.send(JSON.stringify({ type: 'eject' }));
@@ -247,7 +236,6 @@
                     tx = camX;
                     ty = camY;
                 }
-
                 if (tx !== undefined && ty !== undefined) {
                     socket.send(JSON.stringify({ type: 'input', x: tx, y: ty }));
                 }
@@ -270,10 +258,14 @@
                 });
             } else if(isSpectating) {
                 if (specFollowMode && gameState.leaderboard.length > 0) {
-                    const topId = gameState.leaderboard[0].id;
-                    if(localPlayers[topId]) {
-                        const p = localPlayers[topId];
+                    const topPlayer = gameState.leaderboard[0];
+                    if(localPlayers[topPlayer.id]) {
+                        const p = localPlayers[topPlayer.id];
                         p.renderCells.forEach(c => { center.x += c.x; center.y += c.y; center.count++; });
+                    } else if (topPlayer.x !== undefined && topPlayer.y !== undefined) {
+                         center.x = topPlayer.x;
+                         center.y = topPlayer.y;
+                         center.count = 1;
                     } else {
                         center.x = camX; center.y = camY; center.count=1;
                     }

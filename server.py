@@ -517,7 +517,10 @@ class GameWorld:
         visible_viruses = [{'x': int(v.x), 'y': int(v.y), 'm': int(v.mass)} for v in self.viruses if (v.x-cx)**2+(v.y-cy)**2 < v_rad_sq]
         visible_ejected = [{'x': int(e.x), 'y': int(e.y), 'c': e.color} for e in self.ejected_mass if (e.x-cx)**2+(e.y-cy)**2 < v_rad_sq]
         
-        lb = [{'id': p.id, 'name': p.name, 'mass': int(p.total_mass)} for p in sorted([p for p in self.players.values() if not p.is_dead and not p.is_spectator], key=lambda x: x.total_mass, reverse=True)[:10]]
+        lb = []
+        for p in sorted([p for p in self.players.values() if not p.is_dead and not p.is_spectator], key=lambda x: x.total_mass, reverse=True)[:10]:
+            pcx, pcy = p.center
+            lb.append({'id': p.id, 'name': p.name, 'mass': int(p.total_mass), 'x': int(pcx), 'y': int(pcy)})
 
         return {'players': visible_players, 'food': visible_food, 'viruses': visible_viruses, 'ejected': visible_ejected, 'leaderboard': lb}
 
@@ -621,7 +624,6 @@ async def game_loop():
         for pid, p in active_players_snapshot:
             if isinstance(p, Bot): continue
             try: 
-                # ★★★ 修復重點：如果玩家死亡，直接發送死亡封包，否則正常發送遊戲畫面 ★★★
                 if p.is_dead and not p.is_spectator:
                      await p.ws.send(json.dumps({'type': 'death'}))
                 else:
