@@ -10,7 +10,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Deep Learning Server (Ultimate 2025)"
+SERVER_NAME = "Deep Learning Server (Anti-Corner Cancer 2025)"
 SERVER_HOST = "localhost"
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
@@ -22,7 +22,7 @@ MAP_WIDTH = 6000
 MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.0025                # 關鍵修正：不能太低！
+MASS_DECAY_RATE = 0.0025
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
@@ -38,20 +38,24 @@ VIRUS_SHOT_IMPULSE = 850
 # --- 視野優化參數 ---
 GRID_SIZE = 300
 
-# --- 神經網路參數（2025 最強配置）---
+# --- 神經網路參數 ---
 INPUT_SIZE = 42
-HIDDEN_LAYERS = [768, 384, 192, 96]     # 金字塔大模型
-OUTPUT_SIZE = 4                         # 移動X, 移動Y, 分裂, 吐球
+HIDDEN_LAYERS = [768, 384, 192, 96]
+OUTPUT_SIZE = 4
 MUTATION_RATE = 0.02
-MUTATION_STRENGTH = 0.25                # 稍微降低，更穩定
+MUTATION_STRENGTH = 0.25
 BEST_BRAINS = {}
+
+# --- 反角落癌參數 ---
+CORNER_PUNISH_DISTANCE = 850      # 距離角落小於此值開始懲罰
+CORNER_FORCE_ESCAPE_DISTANCE = 700  # 小於此值強制往中心逃
+CORNER_SELF_KILL_PROB = 0.05      # 極近角落時自殺機率（防止死卡）
 
 # --- 輔助函數 ---
 def sigmoid(x): return 1 / (1 + np.exp(-x))
 def mass_to_radius(mass): return 6 * math.sqrt(mass)
 def clamp(n, minn, maxn): return max(min(maxn, n), minn)
 
-# --- 事件類型 ---
 class GameEvent:
     EAT_FOOD = "eat_food"
     EAT_EJECTED = "eat_ejected"
@@ -62,7 +66,6 @@ class GameEvent:
     MERGE_CELLS = "merge"
     VIRUS_SPLIT = "virus_split"
 
-# --- 神經網路大腦 ---
 class DeepBrain:
     def __init__(self, layer_sizes=None, weights=None, biases=None):
         if layer_sizes is None:
@@ -77,55 +80,41 @@ class DeepBrain:
             self.weights = weights
             self.biases = biases
         else:
-            # He Initialization（ReLU 專用！這行決定生死）
+            # He Initialization (ReLU 專用)
             for i in range(len(self.layer_sizes) - 1):
                 n_in = self.layer_sizes[i]
                 n_out = self.layer_sizes[i+1]
-                scale = np.sqrt(2.0 / n_in)                   # ← 關鍵修正
+                scale = np.sqrt(2.0 / n_in)
                 self.weights.append(np.random.randn(n_in, n_out) * scale)
                 self.biases.append(np.zeros(n_out))
 
     def forward(self, inputs):
         x = np.array(inputs, dtype=np.float32)
-
-        # 隱藏層：ReLU
         for i in range(len(self.weights) - 1):
             z = np.dot(x, self.weights[i]) + self.biases[i]
             x = np.maximum(0, z)
-
-        # 輸出層
         z_last = np.dot(x, self.weights[-1]) + self.biases[-1]
-        move_out = np.tanh(z_last[:2])              # (-1, 1)
-        action_out = sigmoid(z_last[2:])            # (0, 1)
+        move_out = np.tanh(z_last[:2])
+        action_out = sigmoid(z_last[2:])
         return np.concatenate((move_out, action_out))
 
     def mutate(self):
         new_weights = []
         new_biases = []
-
         for w, b in zip(self.weights, self.biases):
             nw = w.copy()
             nb = b.copy()
-
-            # 權重突變
             mask_w = np.random.random(w.shape) < MUTATION_RATE
             nw[mask_w] += np.random.randn(*w.shape)[mask_w] * MUTATION_STRENGTH
-
-            # 偏差突變
             mask_b = np.random.random(b.shape) < MUTATION_RATE
             nb[mask_b] += np.random.randn(*b.shape)[mask_b] * MUTATION_STRENGTH
-
-            # 極低機率大突變
             if random.random() < 0.005:
                 ridx = random.randint(0, w.size - 1)
                 nw.flat[ridx] = random.gauss(0, 1)
-
             new_weights.append(nw)
             new_biases.append(nb)
-
         return DeepBrain(self.layer_sizes, new_weights, new_biases)
 
-# --- 其餘類別不變（只改 Bot 部分）---
 class GameObject:
     def __init__(self, x, y, mass, color):
         self.x, self.y = x, y
@@ -283,7 +272,7 @@ class Bot(Player):
 
     def think(self, world):
         now = time.time()
-        if now - self.last_think_time < 0.08: return          # 更快思考
+        if now - self.last_think_time < 0.08: return
         self.last_think_time = now
 
         if self.is_dead:
@@ -301,16 +290,39 @@ class Bot(Player):
 
         cx, cy = self.center
 
-        # 呆滯懲罰
+        # ==================== 反角落癌懲罰（僅針對 Bot） ====================
+        dist_to_border = min(cx, cy, MAP_WIDTH - cx, MAP_HEIGHT - cy)
+
+        if dist_to_border < CORNER_FORCE_ESCAPE_DISTANCE:
+            # 極近角落：高機率直接自殺，防止死卡
+            if random.random() < CORNER_SELF_KILL_PROB:
+                self.is_dead = True
+                return
+            # 強制往地圖中心逃跑
+            center_x, center_y = MAP_WIDTH / 2, MAP_HEIGHT / 2
+            self.mouse_x = center_x + random.uniform(-800, 800)
+            self.mouse_y = center_y + random.uniform(-800, 800)
+            # 增加呆滯懲罰，降低這種基因存活率
+            self.stag_penalty += 300
+            # 即使在角落也強制思考移動
+        elif dist_to_border < CORNER_PUNISH_DISTANCE:
+            # 接近角落：輕度懲罰 + 傾向往中心移動
+            self.stag_penalty += 80
+            if random.random() < 0.3:  # 30% 機率強制往中心偏
+                center_x, center_y = MAP_WIDTH / 2, MAP_HEIGHT / 2
+                self.mouse_x = center_x + random.uniform(-600, 600)
+                self.mouse_y = center_y + random.uniform(-600, 600)
+
+        # 一般呆滯檢查
         if now - self.last_pos_check > 5.0:
             if math.hypot(cx - self.last_pos[0], cy - self.last_pos[1]) < 100:
                 self.stag_penalty += 600
             self.last_pos = (cx, cy)
             self.last_pos_check = now
 
+        # 正常神經網路思考
         out = self.brain.forward(self.get_bot_inputs(world, cx, cy))
 
-        # 更遠視野 + 更敏感動作
         self.mouse_x = cx + out[0] * 900
         self.mouse_y = cy + out[1] * 900
 
