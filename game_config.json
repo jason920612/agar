@@ -1,0 +1,14 @@
+{
+    "map_width": 6000,
+    "map_height": 6000,
+    "player_start_mass": 20,
+    "virus_count": 30,
+    "virus_start_mass": 100,
+    "virus_max_mass": 180,
+    "food_max_count": 1200,
+    "food_min_mass": 5,
+    "food_max_mass": 10,
+    "mass_decay_rate": 0.006,
+    "merge_time_factor": 30,
+    "merge_attraction_force": 0.15
+}
