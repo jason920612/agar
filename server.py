@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Agar.io AI Lab (Genetic Evolution)"
+SERVER_NAME = "Agar.io AI Lab (Admin Tools)"
 SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
@@ -38,7 +38,7 @@ VIRUS_SHOT_IMPULSE = 850
 # --- 視野優化參數 ---
 GRID_SIZE = 300 
 
-# --- BOT 名稱庫 (國家/地區/城市/政治人物) ---
+# --- BOT 名稱庫 ---
 BOT_NAMES = [
     "Taiwan", "USA", "China", "Japan", "Korea", "Russia", "Germany", "France", "UK", "Italy",
     "Canada", "Australia", "Brazil", "India", "Vietnam", "Thailand", "Singapore", "Malaysia",
@@ -68,22 +68,20 @@ class GameEvent:
 # --- 遺傳演算法管理器 ---
 class EvolutionManager:
     def __init__(self):
-        self.gene_pool = [] # 儲存 (score, genes)
+        self.gene_pool = [] 
         self.generation_count = 0
         self.best_score = 0
         
-        # 預設基因範圍 (最小值, 最大值)
         self.base_genes = {
-            'w_food': (5000, 20000),       # 食物吸引力
-            'w_hunt': (1000000, 5000000),  # 獵殺吸引力
-            'w_flee': (-8000000, -2000000),# 逃跑排斥力 (負值)
-            'w_virus': (-20000, 50000),    # 病毒權重 (有些AI可能喜歡躲病毒旁)
-            'split_dist': (200, 700),      # 分裂攻擊距離
-            'split_aggr': (1.1, 1.5)       # 分裂攻擊所需的倍率 (例如對方比我小多少才吃)
+            'w_food': (5000, 20000),       
+            'w_hunt': (1000000, 5000000),  
+            'w_flee': (-8000000, -2000000),
+            'w_virus': (-20000, 50000),    
+            'split_dist': (200, 700),      
+            'split_aggr': (1.1, 1.5)       
         }
 
     def create_random_genes(self):
-        """產生隨機的第一代基因"""
         genes = {}
         for key, (min_v, max_v) in self.base_genes.items():
             genes[key] = random.uniform(min_v, max_v)
@@ -91,33 +89,22 @@ class EvolutionManager:
         return genes
 
     def record_genome(self, bot):
-        """紀錄死亡 Bot 的表現"""
-        # 適應度函數：最大質量 + 存活時間的加權
         score = bot.max_mass_achieved + (time.time() - bot.birth_time) * 2
-        
         if score > self.best_score:
             self.best_score = score
-            # 已移除顯示紀錄的 print
-            # print(f"[EVO] New Record! Gen {bot.genes.get('generation', 1)} | Score: {int(score)} | Mass: {int(bot.max_mass_achieved)}")
-
         self.gene_pool.append((score, copy.deepcopy(bot.genes)))
-        # 只保留前 15 名強者
         self.gene_pool.sort(key=lambda x: x[0], reverse=True)
         self.gene_pool = self.gene_pool[:15]
 
     def get_next_generation_genes(self):
-        """透過輪盤賭或隨機選取強者基因並突變"""
         if not self.gene_pool or random.random() < 0.2:
-            # 20% 機率產生全新隨機種，保持多樣性
             return self.create_random_genes()
         
-        # 選取父母 (偏向高分者)
         parent_genes = random.choice(self.gene_pool)[1]
         child_genes = copy.deepcopy(parent_genes)
         
-        # 突變：隨機調整基因參數 (Mutation Rate)
         for key in self.base_genes:
-            if random.random() < 0.3: # 30% 機率突變某個基因
+            if random.random() < 0.3: 
                 mutation_factor = random.uniform(0.8, 1.2)
                 child_genes[key] *= mutation_factor
         
@@ -194,10 +181,12 @@ class Cell(GameObject):
             if self.mass < BASE_MASS: self.mass = BASE_MASS
 
 class Player:
-    def __init__(self, ws, pid, name, spectate=False):
+    # [Update] 新增 ip 參數
+    def __init__(self, ws, pid, name, ip="Unknown", spectate=False):
         self.ws = ws
         self.id = pid
         self.name = name
+        self.ip = ip  # 儲存 IP
         self.cells = []
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
         self.mouse_x, self.mouse_y = MAP_WIDTH/2, MAP_HEIGHT/2
@@ -226,33 +215,24 @@ class Player:
 
 class Bot(Player):
     def __init__(self, pid, genes=None):
-        # Bot 名稱隨機選取
         bot_name = random.choice(BOT_NAMES)
-        super().__init__(None, pid, bot_name, False)
+        # Bot 的 IP 設為固定值
+        super().__init__(None, pid, bot_name, ip="BOT-AI", spectate=False)
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
-        # 如果沒有給定基因，就隨機生成
         self.genes = genes if genes else evo_manager.create_random_genes()
 
     def decide(self, world):
         if self.is_dead or not self.cells: return None
-
-        # 紀錄最大質量
         current_mass = self.total_mass
         if current_mass > self.max_mass_achieved:
             self.max_mass_achieved = current_mass
-
         my_largest = max(self.cells, key=lambda c: c.mass)
         mx, my = my_largest.x, my_largest.y
         view_dist = 800 + my_largest.radius * 5
-        
         target_x, target_y = 0, 0
-        
-        # 1. 食物吸引力 (使用基因權重)
         w_food = self.genes['w_food']
-        
         gx, gy = int(mx // GRID_SIZE), int(my // GRID_SIZE)
         search_grids = [(gx, gy), (gx+1, gy), (gx-1, gy), (gx, gy+1), (gx, gy-1)]
-        
         food_vec_x, food_vec_y = 0, 0
         for g in search_grids:
             if g in world.food_grid:
@@ -260,15 +240,12 @@ class Bot(Player):
                     dx = f['x'] - mx; dy = f['y'] - my
                     d2 = dx*dx + dy*dy
                     if d2 < view_dist**2:
-                        # 距離越近吸引力越大
                         weight = w_food / (d2 + 1)
                         food_vec_x += dx * weight
                         food_vec_y += dy * weight
-        
         target_x += food_vec_x
         target_y += food_vec_y
 
-        # 2. 玩家互動 (獵殺與逃跑 - 使用基因權重)
         action_intent = None
         w_hunt = self.genes['w_hunt']
         w_flee = self.genes['w_flee']
@@ -281,45 +258,31 @@ class Bot(Player):
                 dx = enemy_cell.x - mx; dy = enemy_cell.y - my
                 dist = math.sqrt(dx**2 + dy**2)
                 if dist > view_dist: continue
-
-                # 逃跑邏輯
                 if enemy_cell.mass > my_largest.mass * 1.15:
-                    # 權重是負的，代表反向排斥
                     weight = w_flee / (dist + 1)
                     target_x += (dx / dist) * weight
                     target_y += (dy / dist) * weight
-                
-                # 獵殺邏輯
                 elif enemy_cell.mass * split_aggr < my_largest.mass:
                     weight = w_hunt / (dist + 1)
                     target_x += (dx / dist) * weight
                     target_y += (dy / dist) * weight
-                    
-                    # 基因決定分裂攻擊的積極度
                     if my_largest.mass > 50 and len(self.cells) < MAX_CELLS:
                         if dist < split_dist:
                             action_intent = 'split'
-
-        # 3. 病毒互動 (使用基因權重)
         w_virus = self.genes['w_virus']
         for v in world.viruses:
             dx = v.x - mx; dy = v.y - my
             dist = math.sqrt(dx**2 + dy**2)
             if dist > view_dist: continue
-
             if my_largest.mass > v.mass * 1.15:
                 if len(self.cells) >= MAX_CELLS:
-                     # 滿細胞時，病毒也是食物
                      target_x += (dx/dist) * 50000
                      target_y += (dy/dist) * 50000
                 else:
-                    # 否則套用基因裡的病毒偏好 (有些基因可能喜歡冒險靠近病毒)
                     if dist < my_largest.radius + 100:
                         weight = w_virus / (dist + 1)
                         target_x += (dx/dist) * weight
                         target_y += (dy/dist) * weight
-
-        # 最終決策
         final_len = math.sqrt(target_x**2 + target_y**2)
         if final_len > 0:
             self.mouse_x = mx + (target_x / final_len) * 500
@@ -327,7 +290,6 @@ class Bot(Player):
         else:
             self.mouse_x = random.randint(0, MAP_WIDTH)
             self.mouse_y = random.randint(0, MAP_HEIGHT)
-
         return action_intent
 
 
@@ -371,25 +333,19 @@ class GameWorld:
         for e in self.ejected_mass: e.move()
         for v in self.viruses: v.move()
         
-        active_players = [p for p in self.players.values() if not p.is_dead]
-        
         # --- BOT Evolution & Update Logic ---
-        for p in list(self.players.values()): # 使用 list copy 以免在迭代中修改字典
+        for p in list(self.players.values()): 
             if isinstance(p, Bot):
                 if p.is_dead:
-                    # BOT 死亡：紀錄基因 -> 獲取下一代基因 -> 轉生
                     evo_manager.record_genome(p)
                     new_genes = evo_manager.get_next_generation_genes()
-                    # 移除舊 Bot，建立新 Bot (ID 保持或更新皆可，這裡更新 ID 以示區別)
                     del self.players[p.id]
-                    
                     global pid_counter
                     new_id = pid_counter; pid_counter += 1
                     new_bot = Bot(new_id, genes=new_genes)
                     new_bot.spawn()
                     self.players[new_id] = new_bot
                     continue
-
                 else:
                     action = p.decide(self)
                     if action == 'split':
@@ -398,7 +354,6 @@ class GameWorld:
                         self.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': p})
         # ------------------------
 
-        # 重新抓取 active_players 因為上面可能換人了
         active_players = [p for p in self.players.values() if not p.is_dead]
 
         for p in active_players:
@@ -430,7 +385,6 @@ class GameWorld:
                     if cell.mass > v.mass * 1.1 and (cell.x-v.x)**2 + (cell.y-v.y)**2 < cell.radius**2:
                         self.event_queue.append({'type': GameEvent.EAT_VIRUS, 'player': p, 'cell_idx': p.cells.index(cell), 'virus': v})
 
-        # 物理碰撞處理
         for p1 in active_players:
             for i in range(len(p1.cells)):
                 for j in range(i+1, len(p1.cells)):
@@ -446,7 +400,6 @@ class GameWorld:
                                  dx, dy = math.cos(rand_ang), math.sin(rand_ang)
                              else: 
                                  dx, dy = (c1.x-c2.x)/dist, (c1.y-c2.y)/dist
-                             
                              f = 0.5
                              c1.x += dx * pen * f
                              c1.y += dy * pen * f
@@ -610,40 +563,49 @@ class GameWorld:
         return {'players': visible_players, 'food': visible_food, 'viruses': visible_viruses, 'ejected': visible_ejected, 'leaderboard': lb}
 
 def manage_game_commands(cmd):
+    """
+    [Update] 新增查詢、增減質量、殺死玩家指令
+    find [name]
+    addmass [id] [amount]
+    removemass [id] [amount]
+    kill [id]
+    killbotall
+    """
     global pid_counter, MAP_WIDTH, MAP_HEIGHT
     
-    if cmd[0] == "setsize" and len(cmd) == 3:
+    command = cmd[0].lower()
+
+    if command == "setsize" and len(cmd) == 3:
         try:
             w, h = int(cmd[1]), int(cmd[2])
             MAP_WIDTH, MAP_HEIGHT = w, h
             print(f"Map size updated to {w}x{h}")
         except ValueError: print("Usage: setsize <width> <height>")
 
-    elif cmd[0] == "clearfood":
+    elif command == "clearfood":
         world.food = []
         world.food_grid = {}
         print("All food cleared.")
 
-    elif cmd[0] == "foodcfg" and len(cmd) == 3:
+    elif command == "foodcfg" and len(cmd) == 3:
         try:
             max_f, rate = int(cmd[1]), int(cmd[2])
             world.max_food = max_f
             print(f"Food Config Updated: Max={max_f}")
         except ValueError: print("Usage: foodcfg <max_amount> <spawn_rate>")
 
-    elif cmd[0] == "addbot":
+    elif command == "addbot":
         try:
             count = int(cmd[1]) if len(cmd) > 1 else 1
             for _ in range(count):
                 bot_id = pid_counter
                 pid_counter += 1
-                # 初始使用隨機基因
                 bot = Bot(bot_id, genes=None)
                 world.players[bot_id] = bot
                 print(f"Bot {bot_id} added.")
         except ValueError: print("Usage: addbot <count>")
 
-    elif cmd[0] == "removebot":
+    elif command == "removebot":
         try:
             count = int(cmd[1]) if len(cmd) > 1 else 1
             removed = 0
@@ -653,8 +615,8 @@ def manage_game_commands(cmd):
                 removed += 1
             print(f"Removed {removed} bots.")
         except ValueError: print("Usage: removebot <count>")
-    
-    elif cmd[0] == "stats":
+
+    elif command == "stats":
         print(f"--- Evo Stats ---")
         print(f"Best Score: {int(evo_manager.best_score)}")
         print(f"Gene Pool Size: {len(evo_manager.gene_pool)}")
@@ -662,8 +624,90 @@ def manage_game_commands(cmd):
              best_gene = evo_manager.gene_pool[0][1]
              print(f"Top Gene (Gen {best_gene['generation']}): Hunt={int(best_gene['w_hunt'])}, Flee={int(best_gene['w_flee'])}")
 
+    # --- [Update] 新增功能 ---
+    
+    elif command == "find":
+        # 根據名字查詢 (部分匹配)
+        if len(cmd) < 2:
+            print("Usage: find <name_fragment>")
+        else:
+            target = cmd[1].lower()
+            found = False
+            print(f"{'ID':<6} {'Name':<15} {'Mass':<8} {'Cells':<6} {'IP Address'}")
+            print("-" * 55)
+            for p in world.players.values():
+                if target in p.name.lower():
+                    print(f"{p.id:<6} {p.name[:15]:<15} {int(p.total_mass):<8} {len(p.cells):<6} {p.ip}")
+                    found = True
+            if not found: print("No matches found.")
+
+    elif command == "addmass":
+        # 增加指定玩家質量
+        if len(cmd) < 3:
+            print("Usage: addmass <player_id> <amount>")
+        else:
+            try:
+                target_id = int(cmd[1])
+                amount = int(cmd[2])
+                p = world.players.get(target_id)
+                if p and not p.is_dead and len(p.cells) > 0:
+                    per_cell = amount / len(p.cells)
+                    for c in p.cells:
+                        c.mass += per_cell
+                    print(f"Added {amount} mass to {p.name} (ID: {target_id}).")
+                else:
+                    print("Player not found or is dead.")
+            except ValueError: print("Invalid ID or Amount.")
+
+    elif command == "removemass":
+        # 減少指定玩家質量
+        if len(cmd) < 3:
+            print("Usage: removemass <player_id> <amount>")
+        else:
+            try:
+                target_id = int(cmd[1])
+                amount = int(cmd[2])
+                p = world.players.get(target_id)
+                if p and not p.is_dead and len(p.cells) > 0:
+                    per_cell_loss = amount / len(p.cells)
+                    for c in p.cells:
+                        c.mass = max(10, c.mass - per_cell_loss) # 質量不低於 10
+                    print(f"Removed {amount} mass from {p.name} (ID: {target_id}).")
+                else:
+                    print("Player not found or is dead.")
+            except ValueError: print("Invalid ID or Amount.")
+
+    elif command == "kill":
+        # 殺死指定玩家
+        if len(cmd) < 2:
+            print("Usage: kill <player_id>")
+        else:
+            try:
+                target_id = int(cmd[1])
+                p = world.players.get(target_id)
+                if p:
+                    p.is_dead = True
+                    p.cells = [] # 清空細胞
+                    print(f"Killed player {p.name} (ID: {target_id}).")
+                else:
+                    print("Player not found.")
+            except ValueError: print("Invalid ID.")
+
+    elif command == "killbotall":
+        # 殺死所有 BOT
+        count = 0
+        # 使用 list(values) 避免在迭代時刪除導致錯誤
+        for p in list(world.players.values()):
+            if isinstance(p, Bot):
+                p.is_dead = True
+                p.cells = []
+                # 注意: 遊戲循環會自動處理移除，或在這裡直接從 world.players 移除也可以
+                # 但為了讓死亡邏輯(基因紀錄)正常運作，我們只設為 is_dead
+                count += 1
+        print(f"Killed {count} bots.")
+
     else:
-        print("Commands: setsize, clearfood, foodcfg, addbot, removebot, stats")
+        print("Commands: setsize, clearfood, foodcfg, addbot, removebot, stats, find, addmass, removemass, kill, killbotall")
 
 async def input_loop():
     loop = asyncio.get_event_loop()
@@ -681,16 +725,24 @@ async def handler(ws):
     global pid_counter
     pid = pid_counter; pid_counter += 1
     player = None
+    
+    # [Update] 獲取遠端 IP
+    remote_ip = "Unknown"
+    if ws.remote_address:
+        remote_ip = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
+
     try:
         async for msg in ws:
             data = json.loads(msg)
             if data['type'] == 'ping': await ws.send(json.dumps({'type':'pong', 'server_name':SERVER_NAME, 'players':len(world.players), 'max_players':MAX_PLAYERS}))
             elif data['type'] == 'join':
-                player = Player(ws, pid, data.get('name', 'Guest')[:15])
+                # [Update] 傳入 IP
+                player = Player(ws, pid, data.get('name', 'Guest')[:15], ip=remote_ip)
                 world.players[pid] = player
+                print(f"[Join] ID:{pid} Name:{player.name} IP:{remote_ip}") # 服務器日誌
                 await ws.send(json.dumps({'type':'init', 'id':pid, 'map':{'w':MAP_WIDTH, 'h':MAP_HEIGHT}}))
             elif data['type'] == 'spectate':
-                player = Player(ws, pid, "Spectator", spectate=True)
+                player = Player(ws, pid, "Spectator", ip=remote_ip, spectate=True)
                 world.players[pid] = player
                 await ws.send(json.dumps({'type':'init', 'id':pid, 'map':{'w':MAP_WIDTH, 'h':MAP_HEIGHT}}))
             elif player and not player.is_spectator:
