@@ -22,7 +22,7 @@ MAP_WIDTH = 6000
 MAP_HEIGHT = 6000
 TICK_RATE = 20
 TICK_LEN = 1 / TICK_RATE
-MASS_DECAY_RATE = 0.0025 
+MASS_DECAY_RATE = 0.006 
 
 # --- 物理與平衡參數 ---
 BASE_MASS = 20
@@ -37,6 +37,17 @@ VIRUS_SHOT_IMPULSE = 850
 
 # --- 視野優化參數 ---
 GRID_SIZE = 300 
+
+# --- BOT 名稱庫 (國家/地區/城市/政治人物) ---
+BOT_NAMES = [
+    "Taiwan", "USA", "China", "Japan", "Korea", "Russia", "Germany", "France", "UK", "Italy",
+    "Canada", "Australia", "Brazil", "India", "Vietnam", "Thailand", "Singapore", "Malaysia",
+    "Tokyo", "New York", "London", "Paris", "Beijing", "Shanghai", "Taipei", "Seoul", "Moscow",
+    "Hong Kong", "Berlin", "Rome", "Washington", "California", "Texas", "Florida",
+    "Trump", "Biden", "Obama", "Putin", "Xi Jinping", "Merkel", "Macron", "Zelensky", 
+    "Kim Jong-un", "Modi", "Trudeau", "Thatcher", "Churchill", "Kennedy", "Lincoln",
+    "Elon Musk", "Zuckerberg", "Bill Gates", "Jobs"
+]
 
 # --- 輔助函數 ---
 def mass_to_radius(mass): return 6 * math.sqrt(mass)
@@ -86,7 +97,8 @@ class EvolutionManager:
         
         if score > self.best_score:
             self.best_score = score
-            print(f"[EVO] New Record! Gen {bot.genes.get('generation', 1)} | Score: {int(score)} | Mass: {int(bot.max_mass_achieved)}")
+            # 已移除顯示紀錄的 print
+            # print(f"[EVO] New Record! Gen {bot.genes.get('generation', 1)} | Score: {int(score)} | Mass: {int(bot.max_mass_achieved)}")
 
         self.gene_pool.append((score, copy.deepcopy(bot.genes)))
         # 只保留前 15 名強者
@@ -214,13 +226,12 @@ class Player:
 
 class Bot(Player):
     def __init__(self, pid, genes=None):
-        # Bot 名稱顯示世代數
-        gen = genes['generation'] if genes else 1
-        super().__init__(None, pid, f"Gen{gen}_Bot", False)
+        # Bot 名稱隨機選取
+        bot_name = random.choice(BOT_NAMES)
+        super().__init__(None, pid, bot_name, False)
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
         # 如果沒有給定基因，就隨機生成
         self.genes = genes if genes else evo_manager.create_random_genes()
-        self.name = f"G{self.genes['generation']}_Bot"
 
     def decide(self, world):
         if self.is_dead or not self.cells: return None
@@ -629,7 +640,7 @@ def manage_game_commands(cmd):
                 # 初始使用隨機基因
                 bot = Bot(bot_id, genes=None)
                 world.players[bot_id] = bot
-                print(f"Bot {bot_id} added (Gen 1).")
+                print(f"Bot {bot_id} added.")
         except ValueError: print("Usage: addbot <count>")
 
     elif cmd[0] == "removebot":
