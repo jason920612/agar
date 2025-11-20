@@ -32,7 +32,7 @@ EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_START_MASS = 100
 VIRUS_MAX_MASS = 180
-VIRUS_COUNT = 50 
+VIRUS_COUNT = 30 
 VIRUS_SHOT_IMPULSE = 850
 
 # --- 視野優化參數 ---
@@ -157,8 +157,15 @@ class Cell(GameObject):
         self.boost_x = 0
         self.boost_y = 0
         self.set_recombine_cooldown()
+        
     def set_recombine_cooldown(self):
-        self.recombine_time = time.time() + (30 + (0.02 * self.mass))
+        # [Modified] 更改為對數關係 (Logarithmic)
+        # 基礎 30 秒 + 係數 * log10(質量)
+        # max(10, self.mass) 確保 log 不會報錯或產生負值
+        # 例如: Mass 100 => 30 + 15*2 = 60s
+        #       Mass 1000 => 30 + 15*3 = 75s
+        self.recombine_time = time.time() + (30 + (15 * math.log10(max(10, self.mass))))
+
     def apply_force(self, fx, fy):
         self.boost_x += fx; self.boost_y += fy
     def move(self, tx, ty):
@@ -181,12 +188,11 @@ class Cell(GameObject):
             if self.mass < BASE_MASS: self.mass = BASE_MASS
 
 class Player:
-    # [Update] 新增 ip 參數
     def __init__(self, ws, pid, name, ip="Unknown", spectate=False):
         self.ws = ws
         self.id = pid
         self.name = name
-        self.ip = ip  # 儲存 IP
+        self.ip = ip
         self.cells = []
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
         self.mouse_x, self.mouse_y = MAP_WIDTH/2, MAP_HEIGHT/2
@@ -216,7 +222,6 @@ class Player:
 class Bot(Player):
     def __init__(self, pid, genes=None):
         bot_name = random.choice(BOT_NAMES)
-        # Bot 的 IP 設為固定值
         super().__init__(None, pid, bot_name, ip="BOT-AI", spectate=False)
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
         self.genes = genes if genes else evo_manager.create_random_genes()
@@ -385,15 +390,31 @@ class GameWorld:
                     if cell.mass > v.mass * 1.1 and (cell.x-v.x)**2 + (cell.y-v.y)**2 < cell.radius**2:
                         self.event_queue.append({'type': GameEvent.EAT_VIRUS, 'player': p, 'cell_idx': p.cells.index(cell), 'virus': v})
 
+        # --- [Modified] 細胞合併邏輯 ---
         for p1 in active_players:
             for i in range(len(p1.cells)):
                 for j in range(i+1, len(p1.cells)):
                     c1, c2 = p1.cells[i], p1.cells[j]
                     dist = math.sqrt((c1.x-c2.x)**2 + (c1.y-c2.y)**2)
+                    
+                    # 判斷誰大誰小 (用於被動合併邏輯)
+                    if c1.mass > c2.mass:
+                        big_cell, small_cell = c1, c2
+                    else:
+                        big_cell, small_cell = c2, c1
+
                     if dist < c1.radius + c2.radius:
-                        if now > c1.recombine_time and now > c2.recombine_time and dist < (c1.radius+c2.radius)*0.65:
+                        # 這裡實作非對稱合併邏輯：
+                        # 1. 如果大細胞 (Active) 已經準備好 => 可以合併 (主動吸收)
+                        # 2. 如果小細胞 (Passive) 已經準備好 => 可以合併 (被動流入)
+                        # 只要有一方滿足時間條件，且距離夠近，就觸發合併
+                        
+                        can_merge = (now > big_cell.recombine_time) or (now > small_cell.recombine_time)
+                        
+                        if can_merge and dist < (c1.radius+c2.radius)*0.65:
                             self.event_queue.append({'type': GameEvent.MERGE_CELLS, 'player': p1, 'idx1': i, 'idx2': j})
-                        elif dist < c1.radius + c2.radius: 
+                        else: 
+                             # 物理推擠 (未合併時)
                              pen = (c1.radius+c2.radius) - dist
                              if dist == 0: 
                                  rand_ang = random.uniform(0, math.pi*2)
@@ -457,10 +478,14 @@ class GameWorld:
                         if c.mass >= 36 and len(p.cells)+len(new_cells) < MAX_CELLS:
                             split_mass = c.mass / 2
                             c.mass = split_mass
-                            c.set_recombine_cooldown()
+                            # [Modified] 確保母體細胞不被重置冷卻時間
+                            # c.set_recombine_cooldown()  <-- 移除此行
+                            
                             dx, dy = p.mouse_x - c.x, p.mouse_y - c.y
                             ang = math.atan2(dy, dx)
                             c.apply_force(-math.cos(ang)*200, -math.sin(ang)*200)
+                            
+                            # 新細胞 (nc) 在初始化時會自動設定冷卻 (見 Cell.__init__)
                             nc = Cell(c.x + math.cos(ang)*c.radius, c.y + math.sin(ang)*c.radius, split_mass, c.color)
                             nc.apply_force(math.cos(ang)*SPLIT_IMPULSE, math.sin(ang)*SPLIT_IMPULSE)
                             new_cells.append(nc)
@@ -490,7 +515,10 @@ class GameWorld:
                          pieces = min(MAX_CELLS - len(p.cells), 7)
                          if pieces > 0:
                             pmass = c.mass / (pieces + 1)
-                            c.mass = pmass; c.set_recombine_cooldown()
+                            c.mass = pmass; 
+                            # 吃病毒通常視為強制分裂，這裡保留重置冷卻比較合理，
+                            # 若也想套用"母體不受影響"，可註解下行。但這行通常視為懲罰。
+                            c.set_recombine_cooldown() 
                             for i in range(pieces):
                                 ang = (i/pieces) * math.pi * 2 + random.uniform(-0.5, 0.5)
                                 nc = Cell(c.x + math.cos(ang)*c.radius*0.8, c.y + math.sin(ang)*c.radius*0.8, pmass, c.color)
@@ -563,14 +591,6 @@ class GameWorld:
         return {'players': visible_players, 'food': visible_food, 'viruses': visible_viruses, 'ejected': visible_ejected, 'leaderboard': lb}
 
 def manage_game_commands(cmd):
-    """
-    [Update] 新增查詢、增減質量、殺死玩家指令
-    find [name]
-    addmass [id] [amount]
-    removemass [id] [amount]
-    kill [id]
-    killbotall
-    """
     global pid_counter, MAP_WIDTH, MAP_HEIGHT
     
     command = cmd[0].lower()
@@ -624,10 +644,7 @@ def manage_game_commands(cmd):
              best_gene = evo_manager.gene_pool[0][1]
              print(f"Top Gene (Gen {best_gene['generation']}): Hunt={int(best_gene['w_hunt'])}, Flee={int(best_gene['w_flee'])}")
 
-    # --- [Update] 新增功能 ---
-    
     elif command == "find":
-        # 根據名字查詢 (部分匹配)
         if len(cmd) < 2:
             print("Usage: find <name_fragment>")
         else:
@@ -642,7 +659,6 @@ def manage_game_commands(cmd):
             if not found: print("No matches found.")
 
     elif command == "addmass":
-        # 增加指定玩家質量
         if len(cmd) < 3:
             print("Usage: addmass <player_id> <amount>")
         else:
@@ -660,7 +676,6 @@ def manage_game_commands(cmd):
             except ValueError: print("Invalid ID or Amount.")
 
     elif command == "removemass":
-        # 減少指定玩家質量
         if len(cmd) < 3:
             print("Usage: removemass <player_id> <amount>")
         else:
@@ -671,14 +686,13 @@ def manage_game_commands(cmd):
                 if p and not p.is_dead and len(p.cells) > 0:
                     per_cell_loss = amount / len(p.cells)
                     for c in p.cells:
-                        c.mass = max(10, c.mass - per_cell_loss) # 質量不低於 10
+                        c.mass = max(10, c.mass - per_cell_loss) 
                     print(f"Removed {amount} mass from {p.name} (ID: {target_id}).")
                 else:
                     print("Player not found or is dead.")
             except ValueError: print("Invalid ID or Amount.")
 
     elif command == "kill":
-        # 殺死指定玩家
         if len(cmd) < 2:
             print("Usage: kill <player_id>")
         else:
@@ -687,22 +701,18 @@ def manage_game_commands(cmd):
                 p = world.players.get(target_id)
                 if p:
                     p.is_dead = True
-                    p.cells = [] # 清空細胞
+                    p.cells = [] 
                     print(f"Killed player {p.name} (ID: {target_id}).")
                 else:
                     print("Player not found.")
             except ValueError: print("Invalid ID.")
 
     elif command == "killbotall":
-        # 殺死所有 BOT
         count = 0
-        # 使用 list(values) 避免在迭代時刪除導致錯誤
         for p in list(world.players.values()):
             if isinstance(p, Bot):
                 p.is_dead = True
                 p.cells = []
-                # 注意: 遊戲循環會自動處理移除，或在這裡直接從 world.players 移除也可以
-                # 但為了讓死亡邏輯(基因紀錄)正常運作，我們只設為 is_dead
                 count += 1
         print(f"Killed {count} bots.")
 
@@ -726,7 +736,6 @@ async def handler(ws):
     pid = pid_counter; pid_counter += 1
     player = None
     
-    # [Update] 獲取遠端 IP
     remote_ip = "Unknown"
     if ws.remote_address:
         remote_ip = f"{ws.remote_address[0]}:{ws.remote_address[1]}"
@@ -736,10 +745,9 @@ async def handler(ws):
             data = json.loads(msg)
             if data['type'] == 'ping': await ws.send(json.dumps({'type':'pong', 'server_name':SERVER_NAME, 'players':len(world.players), 'max_players':MAX_PLAYERS}))
             elif data['type'] == 'join':
-                # [Update] 傳入 IP
                 player = Player(ws, pid, data.get('name', 'Guest')[:15], ip=remote_ip)
                 world.players[pid] = player
-                print(f"[Join] ID:{pid} Name:{player.name} IP:{remote_ip}") # 服務器日誌
+                print(f"[Join] ID:{pid} Name:{player.name} IP:{remote_ip}") 
                 await ws.send(json.dumps({'type':'init', 'id':pid, 'map':{'w':MAP_WIDTH, 'h':MAP_HEIGHT}}))
             elif data['type'] == 'spectate':
                 player = Player(ws, pid, "Spectator", ip=remote_ip, spectate=True)
