@@ -7,6 +7,7 @@ import websockets
 import sys
 import aiohttp 
 import os
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 import copy
 
@@ -14,7 +15,7 @@ import copy
 DEFAULT_CONFIG = {
     "map_width": 6000,
     "map_height": 6000,
-    "player_start_mass": 20,      # 玩家初始質量
+    "player_start_mass": 20,
     "virus_count": 30,
     "virus_start_mass": 100,
     "virus_max_mass": 180,
@@ -22,8 +23,13 @@ DEFAULT_CONFIG = {
     "food_min_mass": 5,
     "food_max_mass": 10,
     "mass_decay_rate": 0.006,
-    "merge_time_factor": 30,      # 基準融合時間 (當質量=初始質量時)
-    "merge_attraction_force": 0.15 # 融合吸引力係數
+    "merge_time_factor": 30,
+    "merge_attraction_force": 0.15,
+    "max_cell_mass": 22600,          # 新增預設值
+    "dynamic_scaling_enabled": True, # 新增預設值
+    "scaling_player_step": 5,        # 新增預設值
+    "scaling_size_percent": 0.2,     # 新增預設值
+    "scaling_resource_percent": 0.2  # 新增預設值
 }
 
 def load_config():
@@ -41,23 +47,29 @@ def load_config():
 GAME_CONFIG = load_config()
 
 # --- 伺服器設定 ---
-SERVER_NAME = "Agar.io AI Lab (Admin Tools)"
+SERVER_NAME = "Agar.io AI Lab (Auto-Scale)"
 SERVER_HOST = "localhost" 
 SERVER_PORT = 8765
 MAX_PLAYERS = 50
 MASTER_URL = "http://localhost:8080" 
 MY_URL = f"ws://{SERVER_HOST}:{SERVER_PORT}"
 
-# --- 遊戲參數 (從 Config 初始化) ---
+# --- 遊戲參數 (初始值) ---
 MAP_WIDTH = GAME_CONFIG['map_width']
 MAP_HEIGHT = GAME_CONFIG['map_height']
-
 VIRUS_COUNT = GAME_CONFIG['virus_count']
 VIRUS_START_MASS = GAME_CONFIG['virus_start_mass']
 VIRUS_MAX_MASS = GAME_CONFIG['virus_max_mass']
 MASS_DECAY_RATE = GAME_CONFIG['mass_decay_rate']
 PLAYER_START_MASS = GAME_CONFIG.get('player_start_mass', 20)
 MERGE_ATTRACTION = GAME_CONFIG.get('merge_attraction_force', 0.15)
+MAX_CELL_MASS = GAME_CONFIG.get('max_cell_mass', 22600)
+
+# --- 動態縮放基準 ---
+BASE_MAP_WIDTH = MAP_WIDTH
+BASE_MAP_HEIGHT = MAP_HEIGHT
+BASE_VIRUS_COUNT = VIRUS_COUNT
+BASE_FOOD_COUNT = GAME_CONFIG.get('food_max_count', 1200)
 
 # --- 物理與常數 ---
 TICK_RATE = 20
@@ -67,8 +79,6 @@ SPLIT_IMPULSE = 780
 EJECT_IMPULSE = 550
 FRICTION = 0.90
 VIRUS_SHOT_IMPULSE = 850
-
-# --- 視野優化參數 ---
 GRID_SIZE = 300 
 
 # --- BOT 名稱庫 ---
@@ -83,7 +93,7 @@ BOT_NAMES = [
 ]
 
 # --- 輔助函數 ---
-def mass_to_radius(mass): return 6 * math.sqrt(mass)
+def mass_to_radius(mass): return 6 * math.sqrt(max(0, mass))
 def clamp(n, minn, maxn): return max(min(maxn, n), minn)
 
 # --- 事件類型 ---
@@ -98,56 +108,38 @@ class GameEvent:
     VIRUS_EXPLODE = "virus_explode"
     VIRUS_SPLIT = "virus_split" 
 
-# --- 遺傳演算法管理器 ---
+# --- 遺傳演算法管理器 (無變更) ---
 class EvolutionManager:
     def __init__(self):
         self.gene_pool = [] 
         self.generation_count = 0
         self.best_score = 0
-        
         self.base_genes = {
-            'w_food': (5000, 20000),       
-            'w_hunt': (1000000, 5000000),  
-            'w_flee': (-8000000, -2000000),
-            'w_virus': (-20000, 50000),    
-            'split_dist': (200, 700),      
-            'split_aggr': (1.1, 1.5)       
+            'w_food': (5000, 20000), 'w_hunt': (1000000, 5000000), 'w_flee': (-8000000, -2000000),
+            'w_virus': (-20000, 50000), 'split_dist': (200, 700), 'split_aggr': (1.1, 1.5)
         }
-
     def create_random_genes(self):
         genes = {}
-        for key, (min_v, max_v) in self.base_genes.items():
-            genes[key] = random.uniform(min_v, max_v)
+        for key, (min_v, max_v) in self.base_genes.items(): genes[key] = random.uniform(min_v, max_v)
         genes['generation'] = 1
         return genes
-
     def record_genome(self, bot):
         score = bot.max_mass_achieved + (time.time() - bot.birth_time) * 2
-        if score > self.best_score:
-            self.best_score = score
+        if score > self.best_score: self.best_score = score
         self.gene_pool.append((score, copy.deepcopy(bot.genes)))
         self.gene_pool.sort(key=lambda x: x[0], reverse=True)
         self.gene_pool = self.gene_pool[:15]
-
     def get_next_generation_genes(self):
-        if not self.gene_pool or random.random() < 0.2:
-            return self.create_random_genes()
-        
+        if not self.gene_pool or random.random() < 0.2: return self.create_random_genes()
         parent_genes = random.choice(self.gene_pool)[1]
         child_genes = copy.deepcopy(parent_genes)
-        
         for key in self.base_genes:
-            if random.random() < 0.3: 
-                mutation_factor = random.uniform(0.8, 1.2)
-                child_genes[key] *= mutation_factor
-        
+            if random.random() < 0.3: child_genes[key] *= random.uniform(0.8, 1.2)
         child_genes['generation'] = parent_genes.get('generation', 1) + 1
         return child_genes
-
 evo_manager = EvolutionManager()
 
 # --- 類別定義 ---
-
 class GameObject:
     def __init__(self, x, y, mass, color):
         self.x, self.y = x, y
@@ -191,49 +183,31 @@ class Cell(GameObject):
         self.boost_x = 0
         self.boost_y = 0
         self.set_recombine_cooldown()
-        
     def set_recombine_cooldown(self):
-        # [修正] 融合時間計算
-        # 設定檔參數：merge_time_factor (當質量 = player_start_mass 時的秒數)
-        # 公式：Time = Factor * (log(CurrentMass) / log(StartMass))
-        # 效果：對數增長。質量越大時間越久，但不會線性無限增加。
-        
         base_factor = GAME_CONFIG.get('merge_time_factor', 30)
         start_mass = GAME_CONFIG.get('player_start_mass', 20)
-        
-        # 防止數學錯誤 (log(1)=0, log(0) error)
         if start_mass < 2: start_mass = 2 
         current_mass = max(self.mass, 2)
-        
-        # 計算對數比率
         log_ratio = math.log(current_mass) / math.log(start_mass)
-        
-        # 計算最終時間，並加上當前時間戳
         recombine_seconds = base_factor * log_ratio
         self.recombine_time = time.time() + recombine_seconds
-
     def apply_force(self, fx, fy):
         self.boost_x += fx; self.boost_y += fy
     def move(self, tx, ty):
         if math.isnan(tx) or math.isnan(ty): return
         dx, dy = tx - self.x, ty - self.y
         dist = math.sqrt(dx**2 + dy**2)
-        
-        # 基礎移動速度
-        base_speed = 300 * (self.mass ** -0.2) 
-        
+        safe_mass = max(self.mass, 1)
+        base_speed = 300 * (safe_mass ** -0.2) 
         if dist > 0:
             speed = min(dist * 5, base_speed)
             self.x += (dx/dist) * speed * TICK_LEN
             self.y += (dy/dist) * speed * TICK_LEN
-            
         self.x += self.boost_x * TICK_LEN
         self.y += self.boost_y * TICK_LEN
         self.boost_x *= FRICTION
         self.boost_y *= FRICTION
-        
     def decay(self):
-        # 使用 player_start_mass 作為不會衰減的底線
         if self.mass > PLAYER_START_MASS:
             self.mass -= self.mass * MASS_DECAY_RATE * TICK_LEN
             if self.mass < PLAYER_START_MASS: self.mass = PLAYER_START_MASS
@@ -253,19 +227,15 @@ class Player:
         self.birth_time = time.time()
         self.max_mass_achieved = 0
         if not spectate: self.spawn()
-        
     @property
     def total_mass(self): return sum([c.mass for c in self.cells])
-    
     @property
     def center(self):
         if self.is_spectator: return (self.mouse_x, self.mouse_y)
         if not self.cells: return (MAP_WIDTH/2, MAP_HEIGHT/2)
         return (sum(c.x for c in self.cells)/len(self.cells), sum(c.y for c in self.cells)/len(self.cells))
-        
     def spawn(self):
         if self.is_spectator: return
-        # [修正] 使用全域變數 PLAYER_START_MASS
         start_m = PLAYER_START_MASS
         self.cells = [Cell(random.randint(100, MAP_WIDTH-100), random.randint(100, MAP_HEIGHT-100), start_m, self.color)]
         self.is_dead = False
@@ -278,12 +248,11 @@ class Bot(Player):
         super().__init__(None, pid, bot_name, ip="BOT-AI", spectate=False)
         self.color = "#%06x" % random.randint(0, 0xFFFFFF)
         self.genes = genes if genes else evo_manager.create_random_genes()
-
     def decide(self, world):
         if self.is_dead or not self.cells: return None
         current_mass = self.total_mass
-        if current_mass > self.max_mass_achieved:
-            self.max_mass_achieved = current_mass
+        if current_mass > self.max_mass_achieved: self.max_mass_achieved = current_mass
+        if not self.cells: return None
         my_largest = max(self.cells, key=lambda c: c.mass)
         mx, my = my_largest.x, my_largest.y
         view_dist = 800 + my_largest.radius * 5
@@ -301,21 +270,18 @@ class Bot(Player):
                         weight = w_food / (d2 + 1)
                         food_vec_x += dx * weight
                         food_vec_y += dy * weight
-        target_x += food_vec_x
-        target_y += food_vec_y
-
+        target_x += food_vec_x; target_y += food_vec_y
         action_intent = None
         w_hunt = self.genes['w_hunt']
         w_flee = self.genes['w_flee']
         split_dist = self.genes['split_dist']
         split_aggr = self.genes['split_aggr']
-        
         for pid, p in world.players.items():
             if p.id == self.id or p.is_dead or p.is_spectator: continue
             for enemy_cell in p.cells:
                 dx = enemy_cell.x - mx; dy = enemy_cell.y - my
                 dist = math.sqrt(dx**2 + dy**2)
-                if dist > view_dist: continue
+                if dist > view_dist or dist <= 0.1: continue
                 if enemy_cell.mass > my_largest.mass * 1.15:
                     weight = w_flee / (dist + 1)
                     target_x += (dx / dist) * weight
@@ -325,13 +291,12 @@ class Bot(Player):
                     target_x += (dx / dist) * weight
                     target_y += (dy / dist) * weight
                     if my_largest.mass > 50 and len(self.cells) < MAX_CELLS:
-                        if dist < split_dist:
-                            action_intent = 'split'
+                        if dist < split_dist: action_intent = 'split'
         w_virus = self.genes['w_virus']
         for v in world.viruses:
             dx = v.x - mx; dy = v.y - my
             dist = math.sqrt(dx**2 + dy**2)
-            if dist > view_dist: continue
+            if dist > view_dist or dist <= 0.1: continue
             if my_largest.mass > v.mass * 1.15:
                 if len(self.cells) >= MAX_CELLS:
                      target_x += (dx/dist) * 50000
@@ -350,7 +315,6 @@ class Bot(Player):
             self.mouse_y = random.randint(0, MAP_HEIGHT)
         return action_intent
 
-
 class GameWorld:
     def __init__(self):
         self.players = {}
@@ -359,9 +323,15 @@ class GameWorld:
         self.viruses = []
         self.ejected_mass = []
         self.event_queue = [] 
-        self.max_food = GAME_CONFIG.get('food_max_count', 1200)
+        self.max_food = BASE_FOOD_COUNT
+        self.target_virus_count = BASE_VIRUS_COUNT
+        
         self.generate_food(int(self.max_food * 0.6))
-        self.generate_viruses(VIRUS_COUNT)
+        self.generate_viruses(self.target_virus_count)
+        
+        # 動態縮放狀態
+        self.last_scaling_check = 0
+        self.map_needs_sync = False # 用於通知廣播
 
     def add_food_to_grid(self, f):
         gx, gy = int(f['x']//GRID_SIZE), int(f['y']//GRID_SIZE)
@@ -393,9 +363,81 @@ class GameWorld:
         for _ in range(amount):
             self.viruses.append(Virus(random.randint(100, MAP_WIDTH-100), random.randint(100, MAP_HEIGHT-100)))
 
+    def check_dynamic_scaling(self):
+        """計算並應用動態地圖與資源縮放"""
+        global MAP_WIDTH, MAP_HEIGHT, VIRUS_COUNT
+        if not GAME_CONFIG.get('dynamic_scaling_enabled', False): return
+
+        player_count = len([p for p in self.players.values() if not p.is_spectator])
+        step = GAME_CONFIG.get('scaling_player_step', 5)
+        size_pct = GAME_CONFIG.get('scaling_size_percent', 0.2)
+        res_pct = GAME_CONFIG.get('scaling_resource_percent', 0.2)
+
+        multiplier = player_count // step
+        
+        # 計算新參數
+        new_width = int(BASE_MAP_WIDTH * (1 + multiplier * size_pct))
+        new_height = int(BASE_MAP_HEIGHT * (1 + multiplier * size_pct))
+        new_max_food = int(BASE_FOOD_COUNT * (1 + multiplier * res_pct))
+        new_virus_count = int(BASE_VIRUS_COUNT * (1 + multiplier * res_pct))
+
+        # 如果發生變化則更新
+        if new_width != MAP_WIDTH or new_height != MAP_HEIGHT:
+            print(f"[Scale] Players: {player_count}, Size: {new_width}x{new_height}, Food: {new_max_food}, Virus: {new_virus_count}")
+            MAP_WIDTH = new_width
+            MAP_HEIGHT = new_height
+            self.max_food = new_max_food
+            self.target_virus_count = new_virus_count
+            VIRUS_COUNT = new_virus_count
+            self.map_needs_sync = True # 標記需要廣播
+
+    def enforce_max_mass(self):
+        """強制分裂過大的細胞"""
+        for p in self.players.values():
+            if p.is_dead or p.is_spectator: continue
+            
+            # 使用新的列表儲存分裂出的細胞，避免在迭代中修改列表
+            cells_to_add = []
+            
+            for c in p.cells:
+                if c.mass >= MAX_CELL_MASS:
+                    # 執行強制分裂邏輯
+                    split_mass = c.mass / 2
+                    c.mass = split_mass
+                    c.set_recombine_cooldown() # 重置合併冷卻
+
+                    # 計算分裂方向 (向滑鼠方向)
+                    dx, dy = p.mouse_x - c.x, p.mouse_y - c.y
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    if dist == 0: dx, dy = 1, 0
+                    else: dx, dy = dx/dist, dy/dist
+
+                    # 創建新細胞
+                    nc = Cell(c.x + dx * c.radius, c.y + dy * c.radius, split_mass, c.color)
+                    
+                    # 施加推力
+                    c.apply_force(-dx * 100, -dy * 100) # 母細胞稍微後退
+                    nc.apply_force(dx * SPLIT_IMPULSE, dy * SPLIT_IMPULSE) # 子細胞射出
+                    
+                    cells_to_add.append(nc)
+
+            # 如果有新細胞，加入玩家列表
+            if cells_to_add:
+                p.cells.extend(cells_to_add)
+                # 如果超過最大細胞數量限制，這裡不強制刪除，因為這是懲罰性分裂
+                # 但如果需要嚴格遵守 16 上限，可以在這裡做修剪，暫時允許超過以便懲罰效果顯著
+
     def update(self):
         now = time.time()
         
+        # 週期性檢查地圖縮放 (每 5 秒)
+        if now - self.last_scaling_check > 5:
+            self.check_dynamic_scaling()
+            self.last_scaling_check = now
+
+        # 強制分裂檢查
+        self.enforce_max_mass()
+
         for e in self.ejected_mass: e.move()
         for v in self.viruses: v.move()
         
@@ -414,41 +456,28 @@ class GameWorld:
                     continue
                 else:
                     action = p.decide(self)
-                    if action == 'split':
-                        self.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': p})
-                    elif action == 'eject':
-                        self.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': p})
-        # ------------------------
+                    if action == 'split': self.event_queue.append({'type': GameEvent.SPLIT_CELL, 'player': p})
+                    elif action == 'eject': self.event_queue.append({'type': GameEvent.EJECT_MASS, 'player': p})
 
         active_players = [p for p in self.players.values() if not p.is_dead]
 
-        # [修正] 融合前的物理吸引機制 (使用參數控制)
         for p in active_players:
             if len(p.cells) > 1:
                 for i in range(len(p.cells)):
                     for j in range(i + 1, len(p.cells)):
                         c1 = p.cells[i]
                         c2 = p.cells[j]
-                        # 只有當兩者都準備好融合時，才產生吸引力
                         if now > c1.recombine_time and now > c2.recombine_time:
-                            dx = c2.x - c1.x
-                            dy = c2.y - c1.y
+                            dx = c2.x - c1.x; dy = c2.y - c1.y
                             dist = math.sqrt(dx**2 + dy**2)
                             if dist > 0:
-                                # 使用 Config 中的 merge_attraction_force
                                 attraction_factor = MERGE_ATTRACTION 
-                                
-                                base_speed_c1 = 300 * (c1.mass ** -0.2)
-                                base_speed_c2 = 300 * (c2.mass ** -0.2)
-                                
-                                pull_x = (dx / dist) * TICK_LEN
-                                pull_y = (dy / dist) * TICK_LEN
-                                
-                                c1.x += pull_x * base_speed_c1 * attraction_factor
-                                c1.y += pull_y * base_speed_c1 * attraction_factor
-                                
-                                c2.x -= pull_x * base_speed_c2 * attraction_factor
-                                c2.y -= pull_y * base_speed_c2 * attraction_factor
+                                safe_mass1 = max(c1.mass, 1); safe_mass2 = max(c2.mass, 1)
+                                base_speed_c1 = 300 * (safe_mass1 ** -0.2)
+                                base_speed_c2 = 300 * (safe_mass2 ** -0.2)
+                                pull_x = (dx / dist) * TICK_LEN; pull_y = (dy / dist) * TICK_LEN
+                                c1.x += pull_x * base_speed_c1 * attraction_factor; c1.y += pull_y * base_speed_c1 * attraction_factor
+                                c2.x -= pull_x * base_speed_c2 * attraction_factor; c2.y -= pull_y * base_speed_c2 * attraction_factor
 
         for p in active_players:
             for cell in p.cells:
@@ -485,17 +514,11 @@ class GameWorld:
                 for j in range(i+1, len(p1.cells)):
                     c1, c2 = p1.cells[i], p1.cells[j]
                     dist = math.sqrt((c1.x-c2.x)**2 + (c1.y-c2.y)**2)
-                    
-                    if c1.mass > c2.mass:
-                        big_cell, small_cell = c1, c2
-                    else:
-                        big_cell, small_cell = c2, c1
-                    
+                    if c1.mass > c2.mass: big_cell, small_cell = c1, c2
+                    else: big_cell, small_cell = c2, c1
                     radius_sum = c1.radius + c2.radius
-                    
                     if dist < radius_sum:
                         can_merge = (now > c1.recombine_time) and (now > c2.recombine_time)
-                        
                         if can_merge and dist < radius_sum * 0.65:
                             self.event_queue.append({'type': GameEvent.MERGE_CELLS, 'player': p1, 'idx1': i, 'idx2': j})
                         elif not can_merge:
@@ -503,14 +526,10 @@ class GameWorld:
                              if dist == 0: 
                                  rand_ang = random.uniform(0, math.pi*2)
                                  dx, dy = math.cos(rand_ang), math.sin(rand_ang)
-                             else: 
-                                 dx, dy = (c1.x-c2.x)/dist, (c1.y-c2.y)/dist
-                             
+                             else: dx, dy = (c1.x-c2.x)/dist, (c1.y-c2.y)/dist
                              f = 0.5
-                             c1.x += dx * pen * f
-                             c1.y += dy * pen * f
-                             c2.x -= dx * pen * f
-                             c2.y -= dy * pen * f
+                             c1.x += dx * pen * f; c1.y += dy * pen * f
+                             c2.x -= dx * pen * f; c2.y -= dy * pen * f
             
             for p2 in active_players:
                 if p1.id == p2.id: continue
@@ -527,7 +546,7 @@ class GameWorld:
         self.process_events()
 
         if len(self.food) < self.max_food: self.generate_food(10)
-        if len(self.viruses) < VIRUS_COUNT: self.generate_viruses(1)
+        if len(self.viruses) < self.target_virus_count: self.generate_viruses(1)
 
     def process_events(self):
         removed_food = set()
@@ -554,7 +573,6 @@ class GameWorld:
                 if prey.mass > 0: 
                     e['predator'].mass += prey.mass
                     prey.mass = 0 
-            
             elif t == GameEvent.SPLIT_CELL:
                 p = e['player']
                 if len(p.cells) < MAX_CELLS:
@@ -563,16 +581,13 @@ class GameWorld:
                         if c.mass >= 36 and len(p.cells)+len(new_cells) < MAX_CELLS:
                             split_mass = c.mass / 2
                             c.mass = split_mass
-                            
                             dx, dy = p.mouse_x - c.x, p.mouse_y - c.y
                             ang = math.atan2(dy, dx)
                             c.apply_force(-math.cos(ang)*200, -math.sin(ang)*200)
-                            
                             nc = Cell(c.x + math.cos(ang)*c.radius, c.y + math.sin(ang)*c.radius, split_mass, c.color)
                             nc.apply_force(math.cos(ang)*SPLIT_IMPULSE, math.sin(ang)*SPLIT_IMPULSE)
                             new_cells.append(nc)
                     p.cells.extend(new_cells)
-            
             elif t == GameEvent.EJECT_MASS:
                 p = e['player']
                 for c in p.cells:
@@ -584,7 +599,6 @@ class GameWorld:
                         ej_x = c.x + math.cos(ang) * c.radius
                         ej_y = c.y + math.sin(ang) * c.radius
                         self.ejected_mass.append(EjectedMass(ej_x, ej_y, ang, c.color, p.id, p.team_id))
-            
             elif t == GameEvent.EAT_VIRUS:
                 v = e['virus']
                 if v.id not in removed_viruses:
@@ -596,9 +610,7 @@ class GameWorld:
                     if len(p.cells) < MAX_CELLS:
                          pieces = min(MAX_CELLS - len(p.cells), 7)
                          if pieces > 0:
-                            pmass = c.mass / (pieces + 1)
-                            c.mass = pmass; 
-                            c.set_recombine_cooldown() 
+                            pmass = c.mass / (pieces + 1); c.mass = pmass; c.set_recombine_cooldown() 
                             for i in range(pieces):
                                 ang = (i/pieces) * math.pi * 2 + random.uniform(-0.5, 0.5)
                                 nc = Cell(c.x + math.cos(ang)*c.radius*0.8, c.y + math.sin(ang)*c.radius*0.8, pmass, c.color)
@@ -680,22 +692,18 @@ def manage_game_commands(cmd):
         try:
             global GAME_CONFIG
             GAME_CONFIG = load_config()
-            
-            # [修正] 更新全域變數
-            global VIRUS_COUNT, VIRUS_START_MASS, VIRUS_MAX_MASS, MASS_DECAY_RATE, PLAYER_START_MASS, MERGE_ATTRACTION
+            global VIRUS_COUNT, VIRUS_START_MASS, VIRUS_MAX_MASS, MASS_DECAY_RATE, PLAYER_START_MASS, MERGE_ATTRACTION, MAX_CELL_MASS
             VIRUS_COUNT = GAME_CONFIG['virus_count']
             VIRUS_START_MASS = GAME_CONFIG['virus_start_mass']
             VIRUS_MAX_MASS = GAME_CONFIG['virus_max_mass']
             MASS_DECAY_RATE = GAME_CONFIG['mass_decay_rate']
             PLAYER_START_MASS = GAME_CONFIG.get('player_start_mass', 20)
             MERGE_ATTRACTION = GAME_CONFIG.get('merge_attraction_force', 0.15)
+            MAX_CELL_MASS = GAME_CONFIG.get('max_cell_mass', 22600)
             
             if 'world' in globals():
                 world.max_food = GAME_CONFIG['food_max_count']
-            
             print("Configuration reloaded successfully.")
-            print(f"Updated -> Start Mass: {PLAYER_START_MASS}, Attraction: {MERGE_ATTRACTION}, Merge Factor: {GAME_CONFIG['merge_time_factor']}")
-            
         except Exception as e:
             print(f"Error reloading config: {e}")
 
@@ -703,6 +711,7 @@ def manage_game_commands(cmd):
         try:
             w, h = int(cmd[1]), int(cmd[2])
             MAP_WIDTH, MAP_HEIGHT = w, h
+            world.map_needs_sync = True # 觸發廣播
             print(f"Map size updated to {w}x{h}")
         except ValueError: print("Usage: setsize <width> <height>")
 
@@ -874,12 +883,27 @@ async def handler(ws):
         if pid in world.players: del world.players[pid]
 
 async def game_loop():
+    print("Game loop started (Auto-Scale Mode).")
     while True:
         t1 = time.time()
-        world.update()
+        try:
+            world.update()
+        except Exception:
+            print("!!! CRITICAL ERROR IN GAME LOOP !!!")
+            traceback.print_exc()
+            await asyncio.sleep(1) # 防止連續錯誤導致 log 爆炸
         
         active_players_snapshot = list(world.players.items())
         
+        # --- 廣播地圖大小變更 ---
+        if world.map_needs_sync:
+            map_data = json.dumps({'type': 'map_update', 'map': {'w': MAP_WIDTH, 'h': MAP_HEIGHT}})
+            for pid, p in active_players_snapshot:
+                if isinstance(p, Bot): continue
+                try: await p.ws.send(map_data)
+                except: pass
+            world.map_needs_sync = False # 重置標記
+
         for pid, p in active_players_snapshot:
             if isinstance(p, Bot): continue 
             

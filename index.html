@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>Agar.io - Neural Client (Final)</title>
+    <title>Agar.io - Auto Scale Client</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #111; font-family: 'Segoe UI', sans-serif; user-select: none; transition: background 0.3s; }
         canvas { display: block; }
@@ -121,6 +121,11 @@
                 if(msg.type === 'init') { 
                     myId = msg.id; 
                     mapSize = msg.map; 
+                    console.log("Map Initialized:", mapSize);
+                }
+                else if (msg.type === 'map_update') {
+                    mapSize = msg.map;
+                    console.log("Map Resized:", mapSize);
                 }
                 else if(msg.type === 'update') { 
                     processUpdate(msg.data); 

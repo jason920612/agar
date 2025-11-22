@@ -6,9 +6,15 @@
     "virus_start_mass": 100,
     "virus_max_mass": 180,
     "food_max_count": 1200,
-    "food_min_mass": 5,
-    "food_max_mass": 10,
-    "mass_decay_rate": 0.006,
+    "food_min_mass": 1,
+    "food_max_mass": 2,
+    "mass_decay_rate": 0.003,
     "merge_time_factor": 30,
-    "merge_attraction_force": 0.15
+    "merge_attraction_force": 0.15,
+    
+    "max_cell_mass": 22600,
+    "dynamic_scaling_enabled": true,
+    "scaling_player_step": 5,
+    "scaling_size_percent": 0.2,
+    "scaling_resource_percent": 0.2
 }
