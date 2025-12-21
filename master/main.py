@@ -5,12 +5,17 @@ Master Server - 伺服器列表管理中心
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Dict, Any
 
 from aiohttp import web
 import websockets
 
 from .config import CHECK_INTERVAL, OFFLINE_TIMEOUT, LISTEN_HOST, LISTEN_PORT
+
+# 取得專案根目錄與 client 目錄路徑
+PROJECT_ROOT = Path(__file__).parent.parent
+CLIENT_DIR = PROJECT_ROOT / "client"
 
 
 class MasterServer:
@@ -115,11 +120,25 @@ class MasterServer:
     def create_app(self) -> web.Application:
         """建立 Web 應用"""
         app = web.Application()
+        
+        # API 路由
         app.add_routes([
             web.get('/list', self.handle_list),
             web.post('/register', self.handle_register),
             web.post('/deregister', self.handle_deregister)
         ])
+        
+        # 靜態檔案服務 (client 目錄)
+        # 根路徑 "/" 返回 index.html
+        async def index_handler(request):
+            return web.FileResponse(CLIENT_DIR / "index.html")
+        
+        app.router.add_get('/', index_handler)
+        
+        # 提供 client 子目錄的靜態檔案 (css, js 等)
+        app.router.add_static('/css/', CLIENT_DIR / "css", name='css')
+        app.router.add_static('/js/', CLIENT_DIR / "js", name='js')
+        
         return app
     
     async def run(self):
