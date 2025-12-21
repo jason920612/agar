@@ -2,11 +2,20 @@
 遊戲伺服器設定模組
 """
 import json
-import os
+import sys
 from pathlib import Path
 
+# 加入專案根目錄到路徑
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from env import (
+    SERVER_NAME, SERVER_HOST, SERVER_PORT,
+    MAX_PLAYERS, MASTER_URL, DEBUG
+)
+
 # 設定檔路徑（相對於專案根目錄）
-CONFIG_PATH = Path(__file__).parent.parent / "game_config.json"
+CONFIG_PATH = PROJECT_ROOT / "game_config.json"
 
 # 預設設定
 DEFAULT_CONFIG = {
@@ -36,12 +45,13 @@ class GameConfig:
     def __init__(self):
         self._config = self._load_config()
         
-        # 伺服器設定
-        self.SERVER_NAME = "Agar.io AI Lab (Auto-Scale)"
-        self.SERVER_HOST = "localhost"
-        self.SERVER_PORT = 8765
-        self.MAX_PLAYERS = 50
-        self.MASTER_URL = "http://localhost:8080"
+        # 伺服器設定 (從環境變數讀取)
+        self.SERVER_NAME = SERVER_NAME
+        self.SERVER_HOST = SERVER_HOST
+        self.SERVER_PORT = SERVER_PORT
+        self.MAX_PLAYERS = MAX_PLAYERS
+        self.MASTER_URL = MASTER_URL
+        self.DEBUG = DEBUG
         
         # 物理常數
         self.TICK_RATE = 20

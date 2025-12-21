@@ -1,9 +1,21 @@
 """
 Master Server 設定
 """
+import sys
+from pathlib import Path
 
-# 伺服器設定
-CHECK_INTERVAL = 30      # 每 30 秒檢查一次
-OFFLINE_TIMEOUT = 300    # 離線超過 300 秒刪除
-LISTEN_HOST = "localhost"
-LISTEN_PORT = 8080
+# 加入專案根目錄到路徑
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from env import (
+    MASTER_HOST, MASTER_PORT,
+    HEALTH_CHECK_INTERVAL, OFFLINE_TIMEOUT as ENV_OFFLINE_TIMEOUT,
+    DEBUG
+)
+
+# 伺服器設定 (從環境變數讀取)
+CHECK_INTERVAL = HEALTH_CHECK_INTERVAL
+OFFLINE_TIMEOUT = ENV_OFFLINE_TIMEOUT
+LISTEN_HOST = MASTER_HOST
+LISTEN_PORT = MASTER_PORT
