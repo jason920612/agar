@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agar.io - Auto Scale Client</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <button id="themeBtn">Toggle Theme</button>
+    
+    <div id="menuOverlay">
+        <div class="menu-container">
+            <div class="menu-box">
+                <h2 style="margin-top:0;">Agar.io AI Server</h2>
+                <input type="text" id="nickname" placeholder="Enter Nickname" maxlength="15">
+                <button id="playBtn">Play Game</button>
+                <button id="specBtn">Spectate</button>
+            </div>
+            <div class="server-list-box">
+                <h3 style="margin:0 0 10px 0; border-bottom:1px solid #eee; padding-bottom:10px;">Servers</h3>
+                <div id="serverListContainer" style="overflow-y:auto; height:250px;">Loading...</div>
+                <button style="margin-top:auto; background:#95a5a6; color:white; padding:8px;">Refresh</button>
+            </div>
+        </div>
+    </div>
+    
+    <div id="hud">FPS: <span id="fps">0</span> | Mass: <span id="massDisplay">0</span></div>
+    <div id="leaderboardBox">
+        <h4 style="margin:0 0 5px 0; text-align:center;">Leaderboard</h4>
+        <ul id="lbList"></ul>
+    </div>
+    
+    <canvas id="gameCanvas"></canvas>
+
+    <script type="module" src="js/game.js"></script>
+</body>
+</html>
