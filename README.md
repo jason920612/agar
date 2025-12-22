@@ -1,4 +1,4 @@
-﻿# Agar.io Clone
+﻿# Agar
 
 一個使用 Python + WebSocket 實作的 Agar.io 遊戲複製版，包含 AI Bot（遺傳演算法驅動）和動態地圖縮放功能。
 
@@ -18,7 +18,7 @@
 
 ```
 agar/
-├── server/                 # 遊戲伺服器
+├── server/                # 遊戲伺服器
 │   ├── __init__.py
 │   ├── config.py          # 設定管理
 │   ├── entities.py        # 遊戲實體 (Cell, Player, Virus...)
@@ -28,12 +28,12 @@ agar/
 │   ├── commands.py        # 伺服器命令處理
 │   └── main.py            # 伺服器入口點
 │
-├── master/                 # Master Server (伺服器列表管理)
+├── master/                # Master Server (伺服器列表管理)
 │   ├── __init__.py
 │   ├── config.py          # Master 設定
 │   └── main.py            # Master 入口點
 │
-├── client/                 # 遊戲客戶端
+├── client/                # 遊戲客戶端
 │   ├── index.html         # 主頁面
 │   ├── css/
 │   │   └── style.css      # 樣式
@@ -151,3 +151,5 @@ python -m server.main  # 啟動遊戲伺服器
 | `addmass <id> <amount>` | 增加玩家質量 |
 | `kill <id>` | 殺死玩家 |
 | `killbotall` | 殺死所有 Bot |
+
+
